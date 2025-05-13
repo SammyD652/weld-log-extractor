@@ -1,7 +1,7 @@
-streamlit>=1.33
-pymupdf>=1.23.4
-Pillow>=10.0.0
-easyocr>=1.7.1
-pandas>=2.2.2
-numpy>=1.26.4
-openpyxl>=3.1.2
+streamlit
+PyMuPDF
+Pillow
+easyocr
+pandas
+numpy
+openpyxl
