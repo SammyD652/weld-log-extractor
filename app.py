@@ -5,7 +5,8 @@ import easyocr
 import pandas as pd
 import math
 import io
-import numpy as np  # <-- Added for easyocr compatibility
+import numpy as np
+
 def distance(p1, p2):
     return math.hypot(p1[0] - p2[0], p1[1] - p2[1])
 
@@ -14,12 +15,13 @@ def pdf_page_to_image(pdf_bytes, page_number=0, zoom=2):
     page = doc.load_page(page_number)
     mat = fitz.Matrix(zoom, zoom)
     pix = page.get_pixmap(matrix=mat)
-    img = Image.open(io.BytesIO(pix.tobytes("png")))
+    img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")  # ensure RGB
     return img
 
 def auto_assign_welds_to_bom(image, df_weld_types, df_bom, max_distance_threshold=150):
-    reader = easyocr.Reader(['en'], gpu=False)
-    results = reader.readtext(np.array(image))  # <-- Fixed: convert PIL to numpy array
+    reader = easyocr.Reader(['en'], gpu=False, verbose=False)  # force CPU and silence output
+    img_np = np.array(image)
+    results = reader.readtext(img_np)
 
     assignments = []
 
@@ -93,7 +95,6 @@ def main():
                 result = auto_assign_welds_to_bom(image, df_weld_types, df_bom, max_distance_threshold=max_dist)
                 st.write("Weld Log:", result)
 
-                # Download Excel
                 output = io.BytesIO()
                 with pd.ExcelWriter(output, engine='openpyxl') as writer:
                     result.to_excel(writer, index=False)
