@@ -1,7 +1,7 @@
 import streamlit as st
 import fitz  # PyMuPDF
 from PIL import Image
-import pytesseract
+import easyocr
 import pandas as pd
 import math
 import io
@@ -18,26 +18,34 @@ def pdf_page_to_image(pdf_bytes, page_number=0, zoom=2):
     return img
 
 def auto_assign_welds_to_bom(image, df_weld_types, df_bom, max_distance_threshold=150):
-    data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DATAFRAME)
-    weld_tags = data[data['text'].str.match(r'^\d{2,4}$', na=False)]
-    bom_tags = data[data['text'].str.match(r'^\d{1,2}$', na=False)]
+    reader = easyocr.Reader(['en'], gpu=False)
+    results = reader.readtext(image)
 
     assignments = []
-    for _, weld in weld_tags.iterrows():
-        weld_pos = (weld['left'] + weld['width'] // 2, weld['top'] + weld['height'] // 2)
-        weld_num = weld['text']
+
+    weld_tags = [(bbox, text) for (bbox, text, conf) in results if text.strip().isdigit() and 2 <= len(text.strip()) <= 4]
+    bom_tags = [(bbox, text) for (bbox, text, conf) in results if text.strip().isdigit() and 1 <= len(text.strip()) <= 2]
+
+    for weld_bbox, weld_num in weld_tags:
+        (x1, y1), (_, _), (x2, y2), (_, _) = weld_bbox
+        weld_pos = ((x1 + x2) / 2, (y1 + y2) / 2)
+
         closest_bom = None
         min_dist = float('inf')
-        for _, bom in bom_tags.iterrows():
-            bom_pos = (bom['left'] + bom['width'] // 2, bom['top'] + bom['height'] // 2)
+
+        for bom_bbox, bom_num in bom_tags:
+            (bx1, by1), (_, _), (bx2, by2), (_, _) = bom_bbox
+            bom_pos = ((bx1 + bx2) / 2, (by1 + by2) / 2)
+
             dist = distance(weld_pos, bom_pos)
             if dist < min_dist:
                 min_dist = dist
-                closest_bom = bom['text']
+                closest_bom = bom_num
+
         if min_dist <= max_distance_threshold:
-            assignments.append({"Weld Number": weld_num, "BOM ID": closest_bom})
+            assignments.append({"Weld Number": weld_num.strip(), "BOM ID": closest_bom})
         else:
-            assignments.append({"Weld Number": weld_num, "BOM ID": None})
+            assignments.append({"Weld Number": weld_num.strip(), "BOM ID": None})
 
     df_assignments = pd.DataFrame(assignments)
     df_welds = pd.merge(df_weld_types, df_assignments, on="Weld Number", how="inner")
@@ -50,7 +58,7 @@ def auto_assign_welds_to_bom(image, df_weld_types, df_bom, max_distance_threshol
     return df_final_weld_log
 
 def main():
-    st.title("Piping Isometric Weld Log Extractor (PyMuPDF Version)")
+    st.title("Piping Isometric Weld Log Extractor (easyocr Version)")
 
     st.markdown("Upload your PDF piping drawing and get back an Excel weld log.")
 
