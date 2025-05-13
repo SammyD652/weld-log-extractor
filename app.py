@@ -5,7 +5,7 @@ import easyocr
 import pandas as pd
 import math
 import io
-
+import numpy as np  # <-- Added for easyocr compatibility
 def distance(p1, p2):
     return math.hypot(p1[0] - p2[0], p1[1] - p2[1])
 
@@ -19,7 +19,7 @@ def pdf_page_to_image(pdf_bytes, page_number=0, zoom=2):
 
 def auto_assign_welds_to_bom(image, df_weld_types, df_bom, max_distance_threshold=150):
     reader = easyocr.Reader(['en'], gpu=False)
-    results = reader.readtext(image)
+    results = reader.readtext(np.array(image))  # <-- Fixed: convert PIL to numpy array
 
     assignments = []
 
@@ -106,4 +106,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
