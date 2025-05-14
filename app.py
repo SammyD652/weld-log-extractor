@@ -1,7 +1,7 @@
 import streamlit as st
 import fitz  # PyMuPDF
 from PIL import Image
-import paddleocr
+import easyocr
 import pandas as pd
 import math
 import io
@@ -19,16 +19,15 @@ def pdf_page_to_image(pdf_bytes, page_number=0, zoom=2):
     return img
 
 def auto_assign_welds_to_bom(image, df_weld_types, df_bom, max_distance_threshold=150):
-    ocr = paddleocr.PaddleOCR(use_angle_cls=True, lang='en')
+    reader = easyocr.Reader(['en'], gpu=False)
     img_np = np.array(image)
-    results = ocr.ocr(img_np, cls=True)
+    results = reader.readtext(img_np)
 
     assignments = []
-
     weld_tags = []
     bom_tags = []
-    for line in results[0]:
-        bbox, (text, confidence) = line
+
+    for (bbox, text, confidence) in results:
         text_clean = text.strip()
         if text_clean.isdigit():
             if 2 <= len(text_clean) <= 4:
@@ -37,15 +36,15 @@ def auto_assign_welds_to_bom(image, df_weld_types, df_bom, max_distance_threshol
                 bom_tags.append((bbox, text_clean))
 
     for weld_bbox, weld_num in weld_tags:
-        (x1, y1), (_, _), (x2, y2), (_, _) = weld_bbox
-        weld_pos = ((x1 + x2) / 2, (y1 + y2) / 2)
+        (x1, y1), (x2, y2), (x3, y3), (x4, y4) = weld_bbox
+        weld_pos = ((x1 + x3) / 2, (y1 + y3) / 2)
 
         closest_bom = None
         min_dist = float('inf')
 
         for bom_bbox, bom_num in bom_tags:
-            (bx1, by1), (_, _), (bx2, by2), (_, _) = bom_bbox
-            bom_pos = ((bx1 + bx2) / 2, (by1 + by2) / 2)
+            (bx1, by1), (bx2, by2), (bx3, by3), (bx4, by4) = bom_bbox
+            bom_pos = ((bx1 + bx3) / 2, (by1 + by3) / 2)
 
             dist = distance(weld_pos, bom_pos)
             if dist < min_dist:
@@ -68,8 +67,7 @@ def auto_assign_welds_to_bom(image, df_weld_types, df_bom, max_distance_threshol
     return df_final_weld_log
 
 def main():
-    st.title("Piping Isometric Weld Log Extractor (PaddleOCR Version)")
-
+    st.title("Piping Isometric Weld Log Extractor (easyocr version)")
     st.markdown("Upload your PDF piping drawing and get back an Excel weld log.")
 
     uploaded_file = st.file_uploader("Choose a PDF file", type="pdf")
@@ -77,9 +75,7 @@ def main():
     if uploaded_file:
         zoom = st.slider("Zoom factor for image extraction", 1, 4, 2)
         max_dist = st.slider("Max Distance Threshold (px)", 50, 300, 150)
-
         image = pdf_page_to_image(uploaded_file.read(), page_number=0, zoom=zoom)
-
         st.image(image, caption="Drawing Preview", use_column_width=True)
 
         st.subheader("Enter Weld Types")
@@ -112,6 +108,9 @@ def main():
                     file_name="weld_log_output.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
+
+if __name__ == "__main__":
+    main()
 
 if __name__ == "__main__":
     main()
