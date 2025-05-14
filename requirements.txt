@@ -1,7 +1,8 @@
 streamlit
-PyMuPDF
+pymupdf
 Pillow
-easyocr
 pandas
 numpy
 openpyxl
+paddleocr
+paddlepaddle
