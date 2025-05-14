@@ -31,5 +31,5 @@ def auto_assign_welds_to_bom(image, df_weld_types, df_bom, max_distance_threshol
         bbox, text, confidence = result
         text_clean = text.strip()
         if text_clean.isdigit():
-            if 2 <= len(text_clean
+if 2 <= len(text_clean):
 
