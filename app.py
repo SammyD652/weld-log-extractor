@@ -1,7 +1,7 @@
 import streamlit as st
 import fitz  # PyMuPDF
 from PIL import Image
-import easyocr
+import paddleocr
 import pandas as pd
 import math
 import io
@@ -15,18 +15,26 @@ def pdf_page_to_image(pdf_bytes, page_number=0, zoom=2):
     page = doc.load_page(page_number)
     mat = fitz.Matrix(zoom, zoom)
     pix = page.get_pixmap(matrix=mat)
-    img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")  # ensure RGB
+    img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
     return img
 
 def auto_assign_welds_to_bom(image, df_weld_types, df_bom, max_distance_threshold=150):
-    reader = easyocr.Reader(['en'], gpu=False, verbose=False)  # force CPU and silence output
+    ocr = paddleocr.PaddleOCR(use_angle_cls=True, lang='en')
     img_np = np.array(image)
-    results = reader.readtext(img_np)
+    results = ocr.ocr(img_np, cls=True)
 
     assignments = []
 
-    weld_tags = [(bbox, text) for (bbox, text, conf) in results if text.strip().isdigit() and 2 <= len(text.strip()) <= 4]
-    bom_tags = [(bbox, text) for (bbox, text, conf) in results if text.strip().isdigit() and 1 <= len(text.strip()) <= 2]
+    weld_tags = []
+    bom_tags = []
+    for line in results[0]:
+        bbox, (text, confidence) = line
+        text_clean = text.strip()
+        if text_clean.isdigit():
+            if 2 <= len(text_clean) <= 4:
+                weld_tags.append((bbox, text_clean))
+            elif 1 <= len(text_clean) <= 2:
+                bom_tags.append((bbox, text_clean))
 
     for weld_bbox, weld_num in weld_tags:
         (x1, y1), (_, _), (x2, y2), (_, _) = weld_bbox
@@ -60,7 +68,7 @@ def auto_assign_welds_to_bom(image, df_weld_types, df_bom, max_distance_threshol
     return df_final_weld_log
 
 def main():
-    st.title("Piping Isometric Weld Log Extractor (easyocr Version)")
+    st.title("Piping Isometric Weld Log Extractor (PaddleOCR Version)")
 
     st.markdown("Upload your PDF piping drawing and get back an Excel weld log.")
 
@@ -107,3 +115,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
