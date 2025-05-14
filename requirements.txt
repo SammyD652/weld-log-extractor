@@ -4,5 +4,5 @@ Pillow
 pandas
 numpy
 openpyxl
-paddleocr
-paddlepaddle
+paddleocr==2.7.0.3
+paddlepaddle==2.5.2
