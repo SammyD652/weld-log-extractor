@@ -19,14 +19,15 @@ def pdf_page_to_image(pdf_bytes, page_number=0, zoom=2):
     return img
 
 def auto_assign_welds_to_bom(image, df_weld_types, df_bom, max_distance_threshold=150):
-    reader = easyocr.Reader(['en'])
+    # 🟢 KEY FIX HERE: force EasyOCR to CPU only
+    reader = easyocr.Reader(['en'], gpu=False)
     img_np = np.array(image)
     results = reader.readtext(img_np)
 
     assignments = []
+
     weld_tags = []
     bom_tags = []
-
     for result in results:
         bbox, text, confidence = result
         text_clean = text.strip()
@@ -68,7 +69,7 @@ def auto_assign_welds_to_bom(image, df_weld_types, df_bom, max_distance_threshol
     return df_final_weld_log
 
 def main():
-    st.title("Piping Isometric Weld Log Extractor (easyocr version)")
+    st.title("Piping Isometric Weld Log Extractor (EasyOCR Version)")
 
     st.markdown("Upload your PDF piping drawing and get back an Excel weld log.")
 
