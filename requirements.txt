@@ -3,4 +3,6 @@ PyMuPDF
 pillow
 pandas
 numpy
-easyocr
+pytesseract
+
+
