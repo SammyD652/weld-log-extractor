@@ -3,3 +3,4 @@ pymupdf
 pillow
 numpy
 pandas
+easyocr
