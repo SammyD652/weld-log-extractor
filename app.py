@@ -1,73 +1,105 @@
-# This script is intended for use in a Streamlit environment.
-# To run it locally: pip install streamlit openai pillow pymupdf pandas
+import streamlit as st
+import fitz  # PyMuPDF
+from PIL import Image
+import easyocr
+import pandas as pd
+import math
+import io
+import numpy as np
 
-try:
-    import streamlit as st
-    import openai
-    from PIL import Image
-    import pandas as pd
-    import io
-    import fitz  # PyMuPDF for PDF to image
-except ModuleNotFoundError as e:
-    print(f"❌ Missing module: {e.name}. Please install dependencies before running.")
-else:
-    st.set_page_config(page_title="GPT-4o Weld Log Extractor")
+reader = easyocr.Reader(['en'], gpu=False)
 
-    st.title("🧠 GPT-4o Weld Log Extractor")
+# --- Helper Functions ---
 
-    uploaded_file = st.file_uploader("Upload a drawing (PDF or image)", type=["pdf", "png", "jpg", "jpeg"])
+def distance(p1, p2):
+    return math.hypot(p1[0] - p2[0], p1[1] - p2[1])
 
-    if uploaded_file:
-        file_bytes = uploaded_file.read()
+def pdf_page_to_image(pdf_bytes, page_number=0, zoom=2):
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    page = doc.load_page(page_number)
+    mat = fitz.Matrix(zoom, zoom)
+    pix = page.get_pixmap(matrix=mat)
+    img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
+    return img
 
-        # Convert PDF to image
-        if uploaded_file.type == "application/pdf":
-            try:
-                doc = fitz.open(stream=file_bytes, filetype="pdf")
-                page = doc.load_page(0)
-                pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-                img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
-            except Exception as e:
-                st.error(f"Failed to read PDF: {e}")
-                st.stop()
+def extract_text_data(image):
+    bounds = reader.readtext(np.array(image))
+    data = []
+    for bbox, text, conf in bounds:
+        x_center = int((bbox[0][0] + bbox[2][0]) / 2)
+        y_center = int((bbox[0][1] + bbox[2][1]) / 2)
+        data.append({
+            "text": text.strip(),
+            "x": x_center,
+            "y": y_center
+        })
+    return pd.DataFrame(data)
+
+def filter_weld_tags(df):
+    return df[df["text"].str.match(r"^(SW|FW)?\s*\d{3}$", case=False, na=False)].copy()
+
+def filter_bom_entries(df):
+    return df[df["text"].str.contains(r"\bND\b", na=False)].copy()
+
+def auto_assign_welds_to_bom(welds_df, bom_df, max_distance=100):
+    assigned = []
+    for _, weld in welds_df.iterrows():
+        weld_pos = (weld['x'], weld['y'])
+        closest = None
+        min_dist = float('inf')
+
+        for _, bom in bom_df.iterrows():
+            bom_pos = (bom['x'], bom['y'])
+            dist = distance(weld_pos, bom_pos)
+            if dist < min_dist and dist <= max_distance:
+                min_dist = dist
+                closest = bom
+
+        if closest is not None:
+            assigned.append({
+                "Weld Tag": weld['text'],
+                "Joint Info": closest['text'],
+                "Distance": round(min_dist, 2)
+            })
         else:
-            try:
-                img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
-            except Exception as e:
-                st.error(f"Failed to load image: {e}")
-                st.stop()
+            assigned.append({
+                "Weld Tag": weld['text'],
+                "Joint Info": "Not found",
+                "Distance": None
+            })
 
-        st.image(img, caption="Uploaded Drawing", use_column_width=True)
+    return pd.DataFrame(assigned)
 
-        if st.button("Extract Weld Log"):
-            st.info("Sending image to GPT-4o...")
+# --- Streamlit App ---
 
-            try:
-                openai.api_key = st.secrets["OPENAI_API_KEY"]
+st.set_page_config(page_title="Weld Log Extractor", layout="wide")
+st.title("🔧 Weld Log Extractor (Beta)")
 
-                response = openai.chat.completions.create(
-                    model="gpt-4o",
-                    messages=[
-                        {"role": "system", "content": "You are a welding QA/QC assistant. Extract weld numbers, joint sizes, joint types, and material descriptions from engineering drawings. Respond in CSV format."},
-                        {"role": "user", "content": "Extract a weld log from this image."}
-                    ],
-                    images=[img]
-                )
+uploaded_file = st.file_uploader("Upload an isometric PDF drawing", type=["pdf"])
 
-                extracted_text = response.choices[0].message.content
-                st.text_area("Extracted Raw Output", extracted_text, height=300)
+if uploaded_file:
+    image = pdf_page_to_image(uploaded_file.read(), page_number=0, zoom=2)
+    st.image(image, caption="Page 1 of uploaded drawing", use_column_width=True)
 
-                # Attempt to parse CSV
-                try:
-                    rows = [row.split(",") for row in extracted_text.strip().split("\n") if "," in row]
-                    df = pd.DataFrame(rows[1:], columns=rows[0])
-                    st.dataframe(df)
+    with st.spinner("Running OCR..."):
+        df = extract_text_data(image)
+        weld_tags_df = filter_weld_tags(df)
+        bom_df = filter_bom_entries(df)
+        assigned_df = auto_assign_welds_to_bom(weld_tags_df, bom_df)
 
-                    csv = df.to_csv(index=False).encode("utf-8")
-                    st.download_button("Download as CSV", csv, "weld_log.csv", "text/csv")
-                except Exception as parse_error:
-                    st.warning("Could not parse structured table from response.")
-                    st.exception(parse_error)
+    st.subheader("📌 Detected Weld Tags")
+    st.dataframe(weld_tags_df)
 
-            except Exception as e:
-                st.error(f"OpenAI call failed: {e}")
+    st.subheader("📋 Detected BOM Entries (ND lines)")
+    st.dataframe(bom_df)
+
+    st.subheader("🔗 Auto-Matched Weld Log")
+    st.dataframe(assigned_df)
+
+    csv = assigned_df.to_csv(index=False).encode('utf-8')
+    st.download_button("Download Weld Log CSV", csv, "weld_log.csv", "text/csv")
+
+    st.success("Weld log extracted and matched successfully!")
+
+else:
+    st.info("Please upload a PDF drawing to get started.")
