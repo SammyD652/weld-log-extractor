@@ -1,14 +1,12 @@
 import streamlit as st
 import fitz  # PyMuPDF
-from PIL import Image
-import easyocr
+from PIL import Image, ImageEnhance, ImageFilter
+import pytesseract
 import pandas as pd
 import math
 import io
 import numpy as np
-
-# 🚀 Load the OCR model once at the top (this is the fix!)
-reader = easyocr.Reader(['en'], gpu=False)
+import re
 
 def distance(p1, p2):
     return math.hypot(p1[0] - p2[0], p1[1] - p2[1])
@@ -22,12 +20,24 @@ def pdf_page_to_image(pdf_bytes, page_number=0, zoom=2):
     return img
 
 def extract_weld_numbers(img):
-    bounds = reader.readtext(np.array(img))
+    # Convert to grayscale and boost contrast
+    img = img.convert("L")
+    img = img.filter(ImageFilter.MedianFilter(size=3))
+    enhancer = ImageEnhance.Contrast(img)
+    img = enhancer.enhance(2)
+    img = img.point(lambda x: 0 if x < 128 else 255, '1')
+
+    # Run OCR
+    text = pytesseract.image_to_string(img)
+
+    # Find SW or FW followed by 3 digits
+    matches = re.findall(r'(SW|FW)?\s*(\d{3})', text)
+
     results = []
-    for bound in bounds:
-        text = bound[1]
-        if any(tag in text for tag in ["SW", "FW"]):
-            results.append(text)
+    for weld_type, weld_no in matches:
+        label = f"{weld_type.strip() if weld_type else ''}{weld_no}"
+        results.append(label)
+
     return results
 
 # Streamlit App
