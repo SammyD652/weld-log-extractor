@@ -4,7 +4,6 @@ import easyocr
 import numpy as np
 
 st.set_page_config(layout="centered")
-
 st.title("Weld Log Drawing Reader")
 
 # Upload an image
@@ -23,3 +22,4 @@ if uploaded_file:
     # Display OCR results
     st.subheader("Detected Text:")
     for (bbox, text, confidence) in result:
+        st.write(f"📌 **{text}** (Confidence: {confidence:.2f})")
