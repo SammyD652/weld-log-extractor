@@ -1,7 +1,7 @@
 streamlit
 pymupdf
 Pillow
-pandas
-numpy
-openpyxl
 easyocr
+numpy
+pandas
+openpyxl
