@@ -1,5 +1,6 @@
 streamlit
-openai
+PyMuPDF
 pillow
-pymupdf
 pandas
+numpy
+easyocr
