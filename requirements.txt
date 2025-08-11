@@ -1,6 +1,7 @@
-streamlit
-easyocr
-pillow
-fitz
-pymupdf
-pandas
+streamlit==1.38.0
+pillow==10.3.0
+pymupdf==1.24.9
+pandas==2.2.2
+python-dotenv==1.0.1
+openai==1.43.0
+xlsxwriter==3.2.0
