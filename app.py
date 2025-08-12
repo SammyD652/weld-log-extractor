@@ -161,12 +161,14 @@ if uploaded:
         preview_cols = st.columns(2)
         images = pdf_pages_to_images(pdf_bytes, max_pages=int(max_pages), dpi=int(dpi))
         # Display preview images across two columns.
-
-
+        # NOTE: st.image uses ``use_column_width`` (not ``use_container_width``) to scale images. Passing
+        # ``use_container_width`` will raise a TypeError in older Streamlit versions. By specifying
+        # ``use_column_width=True``, the image automatically fits within the available column width.
         for i, img in enumerate(images):
             # Each image is displayed within its own column context.
             with preview_cols[i % 2]:
-                st.image(img, caption=f"Page {i+1}")
+                # Use use_column_width to scale the image to the column width
+                st.image(img, caption=f"Page {i+1}", use_column_width=True)
 
 if run_btn:
     if not api_key:
@@ -195,7 +197,23 @@ if run_btn:
         })
 
     # === Call OpenAI ===
+    # Set the API key for the OpenAI client as an environment variable.  
+    # NOTE: Some hosting environments (like Streamlit Cloud) inject HTTP proxy variables
+    # that are incompatible with the OpenAI Python client. These proxy variables cause
+    # ``httpx`` (the underlying HTTP library) to receive an unexpected ``proxies``
+    # argument, which triggers a ``TypeError`` during client construction. To avoid
+    # this issue, we remove any HTTP proxy variables before creating the OpenAI
+    # client. See logs for details of the ``TypeError: Client.__init__() got an
+    # unexpected keyword argument 'proxies'``.
+
     os.environ["OPENAI_API_KEY"] = api_key
+
+    # Remove any proxy-related environment variables to prevent them from being
+    # passed into the OpenAI client via httpx. Without this step, the OpenAI
+    # Python SDK may attempt to use these proxies and fail.
+    for _proxy_var in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"]:
+        os.environ.pop(_proxy_var, None)
+
     from openai import OpenAI
     client = OpenAI(api_key=api_key)
 
