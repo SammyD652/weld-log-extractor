@@ -6,22 +6,21 @@ import pandas as pd
 from PIL import Image
 import streamlit as st
 
-"""
-Streamlit application to extract a weld log from isometric drawing PDFs using
-OpenAI's GPT‑4o Vision model. This version attempts to read an API key from
-Streamlit's secrets configuration (``.streamlit/secrets.toml``) or from the
-``OPENAI_API_KEY`` environment variable. If neither are set, the user may
-provide the key via the sidebar input. The resulting weld log is written to
-an Excel file and made available for download.
+# Streamlit application to extract a weld log from isometric drawing PDFs using
+# OpenAI's GPT‑4o Vision model. This version attempts to read an API key from
+# Streamlit's secrets configuration (``.streamlit/secrets.toml``) or from the
+# ``OPENAI_API_KEY`` environment variable. If neither are set, the user may
+# provide the key via the sidebar input. The resulting weld log is written to
+# an Excel file and made available for download.
+#
+# To run on Streamlit Community Cloud without pasting the key each time,
+# create a file at ``.streamlit/secrets.toml`` in your repository with the
+# following content:
+#
+#     OPENAI_API_KEY = "sk-..."
+#
+# The key will be injected into ``st.secrets`` at runtime.
 
-To run on Streamlit Community Cloud without pasting the key each time,
-create a file at ``.streamlit/secrets.toml`` in your repository with the
-following content:
-
-    OPENAI_API_KEY = "sk-..."
-
-The key will be injected into ``st.secrets`` at runtime.
-"""
 
 # ============ UI ============
 
