@@ -3,48 +3,36 @@ import io
 import base64
 import json
 from typing import List
+
 import fitz  # PyMuPDF
 import pandas as pd
 from PIL import Image
 import streamlit as st
+from openai import OpenAI
 
-# Configure Streamlit page
-st.set_page_config(page_title="Weld Log Extractor — GPT‑4o Vision", layout="wide")
-st.title("Weld Log Extractor — GPT‑4o Vision")
+# --- Streamlit UI ---
+st.set_page_config(page_title="Weld Log Extractor — GPT-4o Vision", layout="wide")
+st.title("Weld Log Extractor — GPT-4o Vision")
 st.caption("Upload your isometric drawing PDF (full drawing, no snips).")
 
+# Sidebar
 with st.sidebar:
-    st.header("1) API Key")
-    api_key_input = st.text_input(
-        "OpenAI API Key", type="password",
-        help="Enter your OpenAI API key, or leave blank to use st.secrets or OPENAI_API_KEY"
-    )
-
-    st.header("2) Model & Pages")
+    st.header("Settings")
     model = st.selectbox("Vision model", ["gpt-4o", "gpt-4o-mini"], index=0)
     max_pages = st.number_input("Max PDF pages to read", min_value=1, max_value=20, value=3, step=1)
-    dpi = st.slider("Image render DPI (higher = sharper, slower)", 100, 300, 220)
-
-    st.header("3) Output")
+    dpi = st.slider("Image render DPI", 100, 300, 220)
     xlsx_name = st.text_input("Excel file name", value="weld_log.xlsx")
 
+# --- Helpers ---
 def get_api_key() -> str:
-    if api_key_input.strip():
-        return api_key_input.strip()
+    # First try Streamlit secrets, then env vars
     try:
-        return st.secrets.get("OPENAI_API_KEY", "")
+        key = st.secrets.get("OPENAI_API_KEY", "")
+        if key:
+            return key
     except Exception:
         pass
     return os.getenv("OPENAI_API_KEY", "")
-
-def clear_proxy_env() -> None:
-    for var in [
-        "HTTP_PROXY", "http_proxy",
-        "HTTPS_PROXY", "https_proxy",
-        "ALL_PROXY", "all_proxy",
-        "NO_PROXY", "no_proxy",
-    ]:
-        os.environ.pop(var, None)
 
 def pdf_pages_to_images(pdf_bytes: bytes, max_pages: int, dpi: int) -> List[Image.Image]:
     images: List[Image.Image] = []
@@ -92,7 +80,7 @@ def json_to_dataframe(json_text: str) -> pd.DataFrame:
         pass
     return pd.DataFrame(columns=["Weld", "Line", "Size", "Schedule", "Material", "Joint", "NDT", "Notes"])
 
-# Main interaction
+# --- Main app ---
 pdf_file = st.file_uploader("PDF file", type=["pdf"])
 if pdf_file:
     st.caption(f"Selected file: {pdf_file.name}")
@@ -101,27 +89,19 @@ if pdf_file:
         images = pdf_pages_to_images(pdf_file.read(), max_pages=int(max_pages), dpi=int(dpi))
         preview_cols = st.columns(2)
         for i, img in enumerate(images):
-            # Use use_column_width=True (not use_container_width) to avoid TypeError
             preview_cols[i % 2].image(img, caption=f"Page {i+1}", use_column_width=True)
 
     if st.button("Extract Weld Log"):
         api_key = get_api_key()
         if not api_key:
-            st.error("No API key provided. Please enter it in the sidebar or set OPENAI_API_KEY.")
+            st.error("No API key found. Please add it to Streamlit Secrets.")
         else:
             images = pdf_pages_to_images(pdf_file.read(), max_pages=int(max_pages), dpi=int(dpi))
             messages = build_vision_messages(images)
-            try:
-                # Clear proxies and set API key in environment
-                clear_proxy_env()
-                os.environ["OPENAI_API_KEY"] = api_key
-                from openai import OpenAI
-                client = OpenAI()  # do NOT pass api_key explicitly
-            except Exception as e:
-                st.error(f"Failed to initialise OpenAI client: {e}")
-                st.stop()
 
-            # Call model
+            # Init client (no proxies)
+            client = OpenAI(api_key=api_key)
+
             with st.spinner("Extracting weld log…"):
                 try:
                     resp = client.chat.completions.create(
@@ -154,4 +134,4 @@ if pdf_file:
 else:
     st.info("Upload a PDF to begin.")
 
-st.caption("Tip: Save your API key in Streamlit secrets by adding OPENAI_API_KEY to .streamlit/secrets.toml.")
+st.caption("Tip: Save your API key in Streamlit Secrets to avoid typing it each time.")
