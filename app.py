@@ -161,12 +161,12 @@ if uploaded:
         preview_cols = st.columns(2)
         images = pdf_pages_to_images(pdf_bytes, max_pages=int(max_pages), dpi=int(dpi))
         # Display preview images across two columns.
-        # `st.image` accepts ``use_column_width`` to scale the image to the column width.  
-        # Using ``use_container_width`` here will raise a TypeError.
+
+
         for i, img in enumerate(images):
             # Each image is displayed within its own column context.
             with preview_cols[i % 2]:
-                st.image(img, caption=f"Page {i+1}", use_column_width=True)
+                st.image(img, caption=f"Page {i+1}")
 
 if run_btn:
     if not api_key:
