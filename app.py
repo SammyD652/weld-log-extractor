@@ -1,7 +1,8 @@
 import io
 import re
+import json
 import base64
-from typing import List, Dict, Set, Tuple
+from typing import List, Dict, Set, Tuple, Optional
 
 import streamlit as st
 import pandas as pd
@@ -9,44 +10,51 @@ import fitz  # PyMuPDF
 from PIL import Image
 
 # =========================
-# Config / Regex
+# Flexible patterns
 # =========================
+# Accept: SW-012, FW 12, sw007, 44, 44A  (prefix optional; suffix letter optional)
+FLEX_PATTERN = re.compile(r"\b(?:(SW|FW)\s*[-]?\s*)?(\d{1,4})([A-Za-z])?\b", re.IGNORECASE)
 
-WELD_PATTERN = r"(SW|FW)\s*[-]?\s*(\d{1,4})"
-WELD_REGEX = re.compile(WELD_PATTERN, re.IGNORECASE)
-
-def normalize_weld_id(raw: str, zero_pad: int = 3) -> str:
-    """
-    Normalises things like 'sw 7', 'SW-07', 'fw12' -> 'SW-007' or 'FW-012'.
-    """
-    m = WELD_REGEX.search(raw)
-    if not m:
-        # Fallback: if pure digits, assume SW
-        m2 = re.search(r"\b(\d{1,4})\b", raw)
-        if not m2:
+def normalize_parts(prefix: Optional[str],
+                    num_str: str,
+                    suffix: Optional[str],
+                    zero_pad: int = 3,
+                    allow_no_prefix: bool = True,
+                    default_prefix: str = "SW") -> str:
+    """Normalise to PREFIX-###[SUFFIX]."""
+    if not num_str.isdigit():
+        m = re.match(r"(\d{1,4})([A-Za-z])?$", num_str)
+        if m:
+            num_str = m.group(1)
+            suffix = suffix or m.group(2)
+    p = (prefix or "").upper()
+    if not p:
+        if not allow_no_prefix:
             return ""
-        return f"SW-{int(m2.group(1)):0{zero_pad}d}"
-    prefix = m.group(1).upper()
-    num = int(m.group(2))
-    return f"{prefix}-{num:0{zero_pad}d}"
+        p = default_prefix
+    n = int(num_str)
+    sfx = (suffix or "").upper()
+    return f"{p}-{n:0{zero_pad}d}{sfx}"
 
 # =========================
 # PDF helpers
 # =========================
-
 def image_bytes_from_page(page: fitz.Page, zoom: float = 3.0, rotate_deg: int = 0) -> bytes:
     mat = fitz.Matrix(zoom, zoom).preRotate(rotate_deg)
     pix = page.get_pixmap(matrix=mat, alpha=False)
     return pix.tobytes("png")
 
-def extract_vector_text_welds(page: fitz.Page) -> Set[str]:
-    """
-    Vector text pass (fast). If text is embedded, this is very accurate.
-    """
+def extract_vector_text_welds(page: fitz.Page,
+                              zero_pad: int,
+                              allow_no_prefix: bool,
+                              default_prefix: str) -> Set[str]:
     results: Set[str] = set()
     text = page.get_text("text") or ""
-    for m in re.finditer(WELD_PATTERN, text, flags=re.IGNORECASE):
-        norm = normalize_weld_id(m.group(0))
+    for m in re.finditer(FLEX_PATTERN, text):
+        norm = normalize_parts(m.group(1), m.group(2), m.group(3),
+                               zero_pad=zero_pad,
+                               allow_no_prefix=allow_no_prefix,
+                               default_prefix=default_prefix)
         if norm:
             results.add(norm)
     return results
@@ -54,108 +62,118 @@ def extract_vector_text_welds(page: fitz.Page) -> Set[str]:
 # =========================
 # OpenAI Vision fallback
 # =========================
-
-def call_openai_vision(api_key: str, image_png_bytes: bytes) -> List[str]:
-    """
-    GPT‑4o‑mini Vision: robust OCR for tricky/rotated/tiny labels.
-    Returns deduped list like ['SW-012','FW-045'].
-    """
+def call_openai_vision(api_key: str, image_png_bytes: bytes) -> str:
+    """Return RAW model text (we’ll parse separately)."""
     from openai import OpenAI
     client = OpenAI(api_key=api_key)
-
     b64 = base64.b64encode(image_png_bytes).decode("utf-8")
     img_url = f"data:image/png;base64,{b64}"
-
     system = (
         "You read engineering isometric drawings. "
-        "Find all weld identifiers on the page. "
-        "A weld identifier looks like SW### or FW###. "
-        "Return ONLY a JSON array of strings, normalised as SW-### or FW-### with 3-digit padding."
+        "Extract ALL weld identifiers you can see. "
+        "Identifiers may be SW###, FW###, or just numbers like 44 or 44A. "
+        "Respond with ONLY a JSON array. Each item: "
+        "{\"raw\": string, \"prefix\": \"SW\"|\"FW\"|null, \"number\": string, \"suffix\": string|null}."
     )
-    user = "Detect and list all weld IDs in this image."
-
+    user = "Return only the JSON array. No commentary."
     resp = client.chat.completions.create(
         model="gpt-4o-mini",
+        temperature=0.0,
         messages=[
             {"role": "system", "content": system},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": user},
-                    {"type": "image_url", "image_url": {"url": img_url}},
-                ],
-            },
+            {"role": "user","content":[
+                {"type":"text","text":user},
+                {"type":"image_url","image_url":{"url":img_url}},
+            ]},
         ],
-        temperature=0.1,
     )
+    return (resp.choices[0].message.content or "").strip()
 
-    text_out = (resp.choices[0].message.content or "").strip()
+def parse_vision_output(raw_text: str,
+                        zero_pad: int,
+                        allow_no_prefix: bool,
+                        default_prefix: str) -> List[str]:
     found: Set[str] = set()
-    for m in re.finditer(WELD_PATTERN, text_out, flags=re.IGNORECASE):
-        found.add(f"{m.group(1).upper()}-{int(m.group(2)):03d}")
+    # 1) Try strict JSON
+    try:
+        data = json.loads(raw_text)
+        if isinstance(data, list):
+            for item in data:
+                if not isinstance(item, dict): continue
+                prefix = item.get("prefix")
+                number = str(item.get("number", "")).strip()
+                suffix = item.get("suffix")
+                norm = normalize_parts(prefix, number, suffix,
+                                       zero_pad=zero_pad,
+                                       allow_no_prefix=allow_no_prefix,
+                                       default_prefix=default_prefix)
+                if norm: found.add(norm)
+    except Exception:
+        pass
+    # 2) Fallback regex sweep
+    for m in re.finditer(FLEX_PATTERN, raw_text):
+        norm = normalize_parts(m.group(1), m.group(2), m.group(3),
+                               zero_pad=zero_pad,
+                               allow_no_prefix=allow_no_prefix,
+                               default_prefix=default_prefix)
+        if norm: found.add(norm)
     return sorted(found)
 
 # =========================
 # Core extraction
 # =========================
-
 def extract_welds_from_pdf(pdf_bytes: bytes,
-                           aggressive: bool = False,
-                           api_key: str = "",
-                           zoom_levels: List[float] = [2.5, 3.0],
-                           rotations: List[int] = [0, 90, 180, 270],
-                           zero_pad: int = 3,
-                           debug: bool = False
-                           ) -> Tuple[List[str], Dict[str, int], bytes]:
-    """
-    Returns (weld_ids, page_hit_counts, preview_png_bytes)
-    """
+                           aggressive: bool,
+                           api_key: str,
+                           zoom_levels: List[float],
+                           rotations: List[int],
+                           zero_pad: int,
+                           allow_no_prefix: bool,
+                           default_prefix: str,
+                           debug: bool
+                           ) -> Tuple[List[str], Dict[str, int], bytes, List[Tuple[int, float, int, str]]]:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     collected: Set[str] = set()
     page_hits: Dict[str, int] = {}
+    vision_debug: List[Tuple[int, float, int, str]] = []
 
-    # Phase 1: vector text
+    # Phase 1: vector
     for i, page in enumerate(doc):
-        vec_welds = extract_vector_text_welds(page)
-        collected.update(vec_welds)
-        page_hits[f"Page {i+1} (vector)"] = len(vec_welds)
+        vec = extract_vector_text_welds(page, zero_pad, allow_no_prefix, default_prefix)
+        collected.update(vec)
+        page_hits[f"Page {i+1} (vector)"] = len(vec)
 
-    # Prepare a small preview (first page, first zoom/rotation)
+    # First-page preview
     preview_png = b""
     try:
-        first_page = doc[0]
-        preview_png = image_bytes_from_page(first_page, zoom=zoom_levels[0], rotate_deg=rotations[0])
+        preview_png = image_bytes_from_page(doc[0], zoom=zoom_levels[0], rotate_deg=rotations[0])
     except Exception:
         pass
 
-    # If not aggressive (or no key), stop here
-    if not aggressive or not api_key.strip():
-        return sorted(collected), page_hits, preview_png
+    # Phase 2: Vision
+    if aggressive and api_key.strip():
+        for i, page in enumerate(doc):
+            for rot in rotations:
+                for z in zoom_levels:
+                    try:
+                        png = image_bytes_from_page(page, zoom=z, rotate_deg=rot)
+                        raw = call_openai_vision(api_key, png)
+                        vision_debug.append((i + 1, z, rot, raw[:500]))
+                        parsed = parse_vision_output(raw, zero_pad, allow_no_prefix, default_prefix)
+                        collected.update(parsed)
+                    except Exception as e:
+                        if debug:
+                            vision_debug.append((i + 1, z, rot, f"[error] {e}"))
 
-    # Phase 2: Vision fallback
-    for i, page in enumerate(doc):
-        for rot in rotations:
-            for z in zoom_levels:
-                try:
-                    png = image_bytes_from_page(page, zoom=z, rotate_deg=rot)
-                    ocr_welds = call_openai_vision(api_key, png)
-                    for w in ocr_welds:
-                        norm = normalize_weld_id(w, zero_pad=zero_pad)
-                        if norm:
-                            collected.add(norm)
-                except Exception as e:
-                    if debug:
-                        print(f"[warn] vision pass failed on page {i+1}, z={z}, rot={rot}: {e}")
-
-    return sorted(collected), page_hits, preview_png
+    return sorted(collected), page_hits, preview_png, vision_debug
 
 def to_dataframe(weld_ids: List[str]) -> pd.DataFrame:
     rows: List[Dict[str, str]] = []
     for w in weld_ids:
-        m = re.match(r"^(SW|FW)-(\d{1,4})$", w)
+        m = re.match(r"^(SW|FW)-(\d{1,4})([A-Z])?$", w)
         rows.append({
             "Weld Number": w,
-            "Joint Type": m.group(1) if m else "",
+            "Joint Type": (m.group(1) if m else ""),
             "Joint Size (ND)": "",
             "Material Description": ""
         })
@@ -170,61 +188,42 @@ def df_to_excel_bytes(df: pd.DataFrame) -> bytes:
 # =========================
 # UI
 # =========================
-
 st.set_page_config(page_title="Weld Log Extractor", layout="centered")
 st.title("📄➡️📊 Weld Log Extractor")
 
 with st.sidebar:
     st.header("⚙️ Settings")
-    aggressive = st.checkbox(
-        "Aggressive mode (better recall)",
-        value=True,
-        help="Uses multi-scale, multi-rotation, and GPT‑Vision to catch tiny/rotated tags."
-    )
+    aggressive = st.checkbox("Aggressive mode (better recall)", value=True)
 
-    # Optional: read API key from secrets if you set .streamlit/secrets.toml
     default_secret = st.secrets.get("general", {}).get("OPENAI_API_KEY", "") if "general" in st.secrets else ""
     api_key = st.text_input("OpenAI API Key (for aggressive mode)", type="password", value=default_secret)
 
-    zoom_text = st.text_input(
-        "Zoom levels (comma‑separated)",
-        value="2.5,3.0,4.0",
-        help="Add 4.0 or 5.0 if labels are very small."
-    )
-    rotation_text = st.text_input(
-        "Rotations (degrees, comma‑separated)",
-        value="0,90,180,270",
-        help="Include all to catch rotated drawings."
-    )
-    zero_pad = st.number_input(
-        "Zero pad digits",
-        min_value=1, max_value=4, value=3,
-        help="Normalises SW-7 -> SW-007."
-    )
-    debug = st.checkbox("Debug mode", value=True, help="Shows per-page hits and a preview image.")
+    zoom_text = st.text_input("Zoom levels (comma-separated)", value="2.5,3.0,4.0,5.0")
+    rotation_text = st.text_input("Rotations (degrees, comma-separated)", value="0,90,180,270")
+    zero_pad = st.number_input("Zero pad digits", min_value=1, max_value=4, value=3)
+
+    allow_no_prefix = st.checkbox("Allow number-only tags (assume SW)", value=True,
+                                  help="If labels are just numbers like 44 or 44A, treat them as SW-044/044A.")
+    default_prefix = st.selectbox("Default prefix for number-only tags", options=["SW", "FW"], index=0)
+
+    debug = st.checkbox("Debug mode", value=True)
 
     def parse_floats(s: str) -> List[float]:
         out = []
         for x in s.split(","):
             x = x.strip()
-            if not x:
-                continue
-            try:
-                out.append(float(x))
-            except:
-                pass
+            if x:
+                try: out.append(float(x))
+                except: pass
         return out or [3.0]
 
     def parse_ints(s: str) -> List[int]:
         out = []
         for x in s.split(","):
             x = x.strip()
-            if not x:
-                continue
-            try:
-                out.append(int(x))
-            except:
-                pass
+            if x:
+                try: out.append(int(x))
+                except: pass
         return out or [0]
 
     zoom_levels = parse_floats(zoom_text)
@@ -235,29 +234,33 @@ uploaded_pdf = st.file_uploader("Upload Isometric PDF", type=["pdf"])
 if st.button("Extract Weld Log", type="primary") and uploaded_pdf:
     with st.spinner("Extracting welds…"):
         pdf_bytes = uploaded_pdf.read()
-        weld_ids, hit_counts, preview_png = extract_welds_from_pdf(
+        weld_ids, hit_counts, preview_png, vision_rows = extract_welds_from_pdf(
             pdf_bytes=pdf_bytes,
             aggressive=aggressive,
             api_key=api_key,
             zoom_levels=zoom_levels,
             rotations=rotations,
             zero_pad=zero_pad,
+            allow_no_prefix=allow_no_prefix,
+            default_prefix=default_prefix,
             debug=debug
         )
         df = to_dataframe(weld_ids)
 
     st.success(f"Found {len(df)} welds")
     if debug:
-        # Per-page vector hits
-        st.subheader("Per‑page vector‑text hits")
+        st.subheader("Per-page vector-text hits")
         st.write(hit_counts)
         if preview_png:
-            st.subheader("OCR preview (first page with first zoom/rotation)")
-            st.image(preview_png, caption="If labels look tiny here, keep zoom 4.0 or try 5.0.")
-
-        # Hint if nothing found
+            st.subheader("OCR preview (first page, first zoom/rotation)")
+            st.image(preview_png, caption="If labels look tiny here, keep zoom 4.0/5.0.")
+        if vision_rows:
+            st.subheader("Raw Vision Output (first 500 chars per pass)")
+            for (pg, z, rot, raw) in vision_rows:
+                st.caption(f"Page {pg} | zoom {z} | rot {rot}")
+                st.code(raw or "", language="json")
         if len(df) == 0:
-            st.info("No vector hits found and/or OCR found none. Enable Aggressive mode, add zoom 4.0 or 5.0, and keep all rotations. If still zero, send me this screen and the PDF so I can add another pattern.")
+            st.info("Still zero found. Keep Aggressive ON, try zoom 5.0, and keep all rotations. Share this screen if it persists.")
 
     st.dataframe(df, use_container_width=True)
 
@@ -272,7 +275,7 @@ if st.button("Extract Weld Log", type="primary") and uploaded_pdf:
 st.markdown(
     """
 **Tips**
-- If a weld is missing, enable **Aggressive mode**, add a higher zoom (e.g., `4.0` or `5.0`), and keep all **Rotations**.
-- If you always get zero from the vector pass, your PDF likely has image‑only text; keep Aggressive mode on.
+- This drawing likely uses number-only balloons. Leave **“Allow number-only tags”** ON.
+- For tiny labels add zoom `5.0` and keep rotations `0,90,180,270`.
 """
 )
