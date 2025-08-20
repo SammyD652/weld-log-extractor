@@ -1,197 +1,264 @@
-import os
 import io
 import re
-import json
 import base64
-from typing import List, Tuple
+from typing import List, Dict, Set, Tuple
 
-import fitz  # PyMuPDF
-import pandas as pd
-from PIL import Image
 import streamlit as st
+import pandas as pd
+import fitz  # PyMuPDF
+from PIL import Image
+from io import BytesIO
 
-# =========================
+# ==========
+# Helpers
+# ==========
+
+WELD_REGEX = re.compile(r"\b(?:SW|FW)\s*-?\s*(\d{1,4})\b", re.IGNORECASE)
+PREFIX_REGEX = re.compile(r"\b(SW|FW)\s*-?\s*(\d{1,4})\b", re.IGNORECASE)
+
+def normalize_weld_id(raw: str, zero_pad: int = 3) -> str:
+    """
+    Normalizes variants like 'sw 7', 'SW-07', 'fw12' -> 'SW-007' or 'FW-012'.
+    """
+    m = PREFIX_REGEX.search(raw)
+    if not m:
+        # try just digits with a best-guess prefix fallback
+        m2 = re.search(r"\b(\d{1,4})\b", raw)
+        if not m2:
+            return ""
+        return f"SW-{int(m2.group(1)):0{zero_pad}d}"
+    prefix = m.group(1).upper()
+    num = int(m.group(2))
+    return f"{prefix}-{num:0{zero_pad}d}"
+
+def image_bytes_from_page(page: fitz.Page, zoom: float = 3.0, rotate_deg: int = 0) -> bytes:
+    mat = fitz.Matrix(zoom, zoom).preRotate(rotate_deg)
+    pix = page.get_pixmap(matrix=mat, alpha=False)
+    return pix.tobytes("png")
+
+def extract_vector_text_welds(page: fitz.Page) -> Set[str]:
+    """
+    Gets text from vector layer (no OCR) and extracts weld IDs via regex.
+    """
+    results: Set[str] = set()
+    # 'text' is fast; 'dict' gives spans, but 'text' usually suffices for labels
+    text = page.get_text("text")
+    for match in re.finditer(r"(SW|FW)\s*-?\s*(\d{1,4})", text, flags=re.IGNORECASE):
+        raw = match.group(0)
+        norm = normalize_weld_id(raw)
+        if norm:
+            results.add(norm)
+    return results
+
+def call_openai_vision(api_key: str, image_png_bytes: bytes) -> List[str]:
+    """
+    Calls GPT-4o-mini for robust OCR of weld tags from an image.
+    Returns a list of strings that look like weld IDs (e.g., 'SW-012', 'FW-101').
+    """
+    from openai import OpenAI
+    client = OpenAI(api_key=api_key)
+
+    # Encode image
+    b64 = base64.b64encode(image_png_bytes).decode("utf-8")
+    img_url = f"data:image/png;base64,{b64}"
+
+    system = (
+        "You read engineering isometric drawings. "
+        "Find all weld identifiers on the page. "
+        "A weld identifier is typically SW### or FW### (e.g., SW-012, FW 45). "
+        "Return ONLY a JSON array of strings with the unique weld IDs you can see. "
+        "No explanations."
+    )
+    user = (
+        "Detect all weld IDs (like SW### or FW###) from this image. "
+        "Please normalise to SW-### or FW-### with zero-padding to 3 digits if needed."
+    )
+
+    # Use responses API (vision)
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": system},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": user},
+                    {"type": "image_url", "image_url": {"url": img_url}},
+                ],
+            },
+        ],
+        temperature=0.1,
+    )
+
+    text_out = resp.choices[0].message.content or "[]"
+    # Attempt to parse array of strings
+    # Keep robust: pull SW/FW patterns from the response in case it isn't pure JSON
+    found = set(re.findall(r"(?:SW|FW)\s*-?\s*(\d{1,4})", text_out, flags=re.IGNORECASE))
+    welds = []
+    for n in found:
+        # we don't know the prefix from this simple regex; try to recover from full text
+        # safer approach: search pairs to recover prefix+number
+        for m in re.finditer(r"(SW|FW)\s*-?\s*(\d{1,4})", text_out, flags=re.IGNORECASE):
+            prefix = m.group(1).upper()
+            num = int(m.group(2))
+            welds.append(f"{prefix}-{num:03d}")
+    return sorted(set(welds))
+
+def merge_sets(*sets: Set[str]) -> List[str]:
+    all_items: Set[str] = set()
+    for s in sets:
+        all_items.update(s)
+    return sorted(all_items)
+
+def extract_welds_from_pdf(pdf_bytes: bytes,
+                           aggressive: bool = False,
+                           api_key: str = "",
+                           zoom_levels: List[float] = [2.5, 3.0],
+                           rotations: List[int] = [0, 90, 180, 270],
+                           zero_pad: int = 3) -> List[str]:
+    """
+    Two-phase approach:
+    1) Vector text pass (fast, very accurate when labels are vector).
+    2) Optional aggressive pass: multi-scale + rotation + GPT-vision OCR, merge & dedupe.
+    """
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    collected: Set[str] = set()
+
+    # PHASE 1: Vector text
+    for page in doc:
+        vec_welds = extract_vector_text_welds(page)
+        collected.update(vec_welds)
+
+    if not aggressive:
+        # Done
+        return sorted(collected)
+
+    # PHASE 2: Vision fallback
+    if not api_key.strip():
+        # If aggressive is on but no key, just return what we got from vector text.
+        return sorted(collected)
+
+    for page in doc:
+        for rot in rotations:
+            for z in zoom_levels:
+                try:
+                    png = image_bytes_from_page(page, zoom=z, rotate_deg=rot)
+                    ocr_welds = call_openai_vision(api_key, png)
+                    # Normalize again to be safe
+                    for w in ocr_welds:
+                        norm = normalize_weld_id(w, zero_pad=zero_pad)
+                        if norm:
+                            collected.add(norm)
+                except Exception as e:
+                    # Keep going; don't break extraction because one scale failed
+                    print(f"[warn] vision pass failed at zoom {z}, rot {rot}: {e}")
+
+    return sorted(collected)
+
+def to_dataframe(weld_ids: List[str]) -> pd.DataFrame:
+    # Split into columns: Prefix (SW/FW) + Number
+    rows: List[Dict[str, str]] = []
+    for w in weld_ids:
+        m = re.match(r"^(SW|FW)-(\d{1,4})$", w)
+        if m:
+            rows.append({
+                "Weld Number": w,
+                "Joint Type": m.group(1),   # You can improve mapping if you store true joint type elsewhere
+                "Joint Size (ND)": "",      # Filled elsewhere if you join with BOM
+                "Material Description": ""  # Filled elsewhere if you join with spec/BOM
+            })
+        else:
+            rows.append({
+                "Weld Number": w,
+                "Joint Type": "",
+                "Joint Size (ND)": "",
+                "Material Description": ""
+            })
+    return pd.DataFrame(rows)
+
+def df_to_excel_bytes(df: pd.DataFrame) -> bytes:
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        df.to_excel(writer, index=False, sheet_name="Weld Log")
+    return output.getvalue()
+
+# ==========
 # UI
-# =========================
-st.set_page_config(page_title="Weld Log Extractor — PDF → Excel", layout="wide")
-st.title("Weld Log Extractor — PDF → Excel")
-st.caption("Upload the full isometric PDF. The app renders a few pages as images and asks GPT‑4o Vision to extract the weld log.")
+# ==========
+
+st.set_page_config(page_title="Weld Log Extractor", layout="centered")
+st.title("📄➡️📊 Weld Log Extractor")
 
 with st.sidebar:
-    st.header("Settings")
-    model = st.selectbox("Vision model", ["gpt-4o", "gpt-4o-mini"], index=0)
-    max_pages = st.number_input("Max PDF pages to read", min_value=1, max_value=15, value=3, step=1)
-    dpi = st.slider("Image render DPI", 120, 300, 220)
-    file_name = st.text_input("Excel file name", value="weld_log.xlsx")
+    st.header("⚙️ Settings")
+    aggressive = st.checkbox("Aggressive mode (better recall)", value=True,
+                             help="Uses multi-scale, multi-rotation, and GPT‑Vision to catch tiny/rotated tags.")
+    api_key = st.text_input("OpenAI API Key (for aggressive mode)", type="password")
+    zoom_text = st.text_input("Zoom levels (comma‑separated)", value="2.5,3.0",
+                              help="Higher zoom increases recall but costs more tokens/time in aggressive mode.")
+    rotation_text = st.text_input("Rotations (degrees, comma‑separated)", value="0,90,180,270",
+                                  help="Include 90/180/270 to catch rotated drawings.")
+    zero_pad = st.number_input("Zero pad digits", min_value=1, max_value=4, value=3,
+                               help="Will normalise SW-7 -> SW-007, etc.")
 
-# =========================
-# Helpers
-# =========================
-def get_api_key() -> str:
-    # Streamlit Cloud: set in Settings → Secrets: OPENAI_API_KEY = "sk-..."
-    try:
-        key = st.secrets.get("OPENAI_API_KEY", "")
-        if key:
-            return key
-    except Exception:
-        pass
-    return os.getenv("OPENAI_API_KEY", "")
+    def parse_floats(s: str) -> List[float]:
+        out = []
+        for x in s.split(","):
+            x = x.strip()
+            if not x:
+                continue
+            try:
+                out.append(float(x))
+            except:
+                pass
+        return out or [3.0]
 
-def pdf_pages_to_images(pdf_bytes: bytes, max_pages: int, dpi: int) -> List[Image.Image]:
-    images: List[Image.Image] = []
-    zoom = dpi / 72.0
-    mat = fitz.Matrix(zoom, zoom)
-    with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
-        pages = min(len(doc), max_pages)
-        for i in range(pages):
-            pix = doc[i].get_pixmap(matrix=mat, alpha=False)
-            img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-            images.append(img)
-    return images
+    def parse_ints(s: str) -> List[int]:
+        out = []
+        for x in s.split(","):
+            x = x.strip()
+            if not x:
+                continue
+            try:
+                out.append(int(x))
+            except:
+                pass
+        return out or [0]
 
-def pil_to_base64(img: Image.Image) -> str:
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return base64.b64encode(buf.getvalue()).decode()
+    zoom_levels = parse_floats(zoom_text)
+    rotations = parse_ints(rotation_text)
 
-def build_prompt_and_content(images: List[Image.Image]) -> list:
-    """
-    Strictly request the four fields required for your weld log.
-    """
-    instruction = (
-        "You are a welding QA assistant. Extract a weld log from these isometric drawing pages.\n"
-        "Return STRICT JSON ONLY (no commentary), an array of objects.\n"
-        "Fields (exact keys):\n"
-        '  "Weld Number", "Joint Size (ND)", "Joint Type", "Material Description"\n'
-        "Rules:\n"
-        "  • If a field isn’t visible, use an empty string.\n"
-        "  • Do NOT include additional fields.\n"
-        "  • Keep numeric strings as they appear (e.g., 'DN50', '2\"').\n"
-        "  • Do not deduplicate; return all seen welds.\n"
-    )
-    content = [{"type": "text", "text": instruction}]
-    for img in images:
-        content.append({
-            "type": "image_url",
-            "image_url": {"url": f"data:image/png;base64,{pil_to_base64(img)}"}
-        })
-    return [{"role": "user", "content": content}]
+uploaded_pdf = st.file_uploader("Upload Isometric PDF", type=["pdf"])
 
-def extract_json_block(text: str) -> str:
-    """
-    If the model returns extra prose, try to pull the first JSON array.
-    """
-    text = text.strip()
-    if text.startswith("[") and text.endswith("]"):
-        return text
-    m = re.search(r"\[\s*\{.*?\}\s*\]", text, flags=re.S)
-    return m.group(0) if m else text
-
-def to_dataframe(json_text: str) -> pd.DataFrame:
-    try:
-        data = json.loads(json_text)
-        if isinstance(data, list):
-            # Validate columns and coerce
-            cols = ["Weld Number", "Joint Size (ND)", "Joint Type", "Material Description"]
-            df = pd.DataFrame(data)
-            for c in cols:
-                if c not in df.columns:
-                    df[c] = ""
-            return df[cols]
-    except Exception:
-        pass
-    # fallback empty
-    return pd.DataFrame(columns=["Weld Number", "Joint Size (ND)", "Joint Type", "Material Description"])
-
-# --- OpenAI call (works whether openai lib is present or not) ---
-def call_openai(messages: list, model: str, api_key: str) -> Tuple[bool, str]:
-    """
-    Returns (ok, text). Uses 'openai' client if available, else raw HTTP via requests.
-    """
-    try:
-        from openai import OpenAI  # Streamlit Cloud installs per requirements.txt
-        client = OpenAI(api_key=api_key)
-        resp = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            temperature=0.1,
-            max_tokens=2000,
+if st.button("Extract Weld Log", type="primary") and uploaded_pdf:
+    with st.spinner("Extracting welds..."):
+        pdf_bytes = uploaded_pdf.read()
+        weld_ids = extract_welds_from_pdf(
+            pdf_bytes=pdf_bytes,
+            aggressive=aggressive,
+            api_key=api_key,
+            zoom_levels=zoom_levels,
+            rotations=rotations,
+            zero_pad=zero_pad
         )
-        return True, resp.choices[0].message.content.strip()
-    except Exception:
-        try:
-            import requests
-            url = "https://api.openai.com/v1/chat/completions"
-            headers = {
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            }
-            payload = {
-                "model": model,
-                "messages": messages,
-                "temperature": 0.1,
-                "max_tokens": 2000,
-            }
-            r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=60)
-            r.raise_for_status()
-            data = r.json()
-            return True, data["choices"][0]["message"]["content"].strip()
-        except Exception as e:
-            return False, f"OpenAI call failed: {e}"
+        df = to_dataframe(weld_ids)
 
-# =========================
-# Main
-# =========================
-pdf_file = st.file_uploader("Upload PDF", type=["pdf"])
+    st.success(f"Found {len(df)} welds")
+    st.dataframe(df, use_container_width=True)
 
-if pdf_file:
-    st.caption(f"Selected: {pdf_file.name}")
-    col1, col2 = st.columns(2)
-    if col1.button("Preview pages"):
-        imgs = pdf_pages_to_images(pdf_file.read(), max_pages=int(max_pages), dpi=int(dpi))
-        show_cols = st.columns(2)
-        for i, im in enumerate(imgs):
-            show_cols[i % 2].image(im, caption=f"Page {i+1}", use_container_width=True)
+    excel_bytes = df_to_excel_bytes(df)
+    st.download_button(
+        label="Download Excel",
+        data=excel_bytes,
+        file_name="weld_log.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
 
-    if col2.button("Extract Weld Log"):
-        api_key = get_api_key()
-        if not api_key:
-            st.error("No API key found. In Streamlit Cloud: Settings → Secrets → add OPENAI_API_KEY.")
-            st.stop()
-
-        # Re-read file for extraction (uploader stream gets consumed by preview)
-        pdf_bytes = pdf_file.getvalue()
-        images = pdf_pages_to_images(pdf_bytes, max_pages=int(max_pages), dpi=int(dpi))
-        messages = build_prompt_and_content(images)
-
-        with st.spinner("Reading PDF, calling GPT‑4o Vision, and parsing…"):
-            ok, raw = call_openai(messages, model, api_key)
-
-        if not ok:
-            st.error(raw)
-            st.stop()
-
-        raw_json = extract_json_block(raw)
-        df = to_dataframe(raw_json)
-
-        if df.empty:
-            st.warning("No structured welds returned. Showing raw output for debugging below.")
-            st.code(raw, language="json")
-        else:
-            st.success(f"Extracted {len(df)} weld(s).")
-            st.dataframe(df, use_container_width=True)
-
-            buf = io.BytesIO()
-            with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
-                df.to_excel(writer, index=False, sheet_name="Weld Log")
-
-            st.download_button(
-                label="Download Excel",
-                data=buf.getvalue(),
-                file_name=file_name or "weld_log.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                type="primary",
-            )
-else:
-    st.info("Upload a PDF to begin.")
-st.caption("Tip: In Streamlit Cloud, set OPENAI_API_KEY in Settings → Secrets so you don’t type it every time.")
+st.markdown(
+    """
+    **Notes**
+    - If a few welds are missing, try enabling **Aggressive mode**, increasing **Zoom levels** (e.g., `2.5,3.0,4.0`),
+      and ensuring all **Rotations** are included.
+    - Keep requirements lean for faster startup.
+    """
+)
