@@ -31,6 +31,9 @@ def get_client() -> OpenAI:
 # 2) PDF → images (PIL) via pypdfium2
 # -----------------------------
 def pdf_bytes_to_images(pdf_bytes: bytes, scale: float = 2.0) -> List[Image.Image]:
+    """
+    Render each page to a PIL image using pypdfium2.
+    """
     images: List[Image.Image] = []
     pdf = pdfium.PdfDocument(io.BytesIO(pdf_bytes))
     for i in range(len(pdf)):
@@ -62,7 +65,6 @@ def normalize_shop_field(val: str) -> str:
     return ""
 
 def clean_row(rec: Dict) -> Dict:
-    """Coerce and trim fields; never invent values."""
     return {
         "Weld Number": str(rec.get("Weld Number", "") or "").strip(),
         "Shop/Field": normalize_shop_field(rec.get("Shop/Field", "")),
@@ -81,7 +83,7 @@ def dedupe_by_weld_number(rows: List[Dict]) -> List[Dict]:
     return out
 
 # -----------------------------
-# 4) OpenAI Vision call (new SDK)
+# 4) OpenAI Vision (chat.completions with JSON forcing)
 # -----------------------------
 SYSTEM_PROMPT = (
     "You are a meticulous extraction engine for welding documents. "
@@ -92,10 +94,8 @@ SYSTEM_PROMPT = (
 
 USER_RULES = (
     "From these isometric drawing pages, extract a table with EXACTLY these 4 fields:\n"
-    "1) Weld Number\n"
-    "2) Shop/Field (normalize SW/S/W → 'Shop', FW/F/W → 'Field')\n"
-    "3) Weld Size\n"
-    "4) Spec\n"
+    "1) Weld Number\n2) Shop/Field (normalize SW/S/W → 'Shop', FW/F/W → 'Field')\n"
+    "3) Weld Size\n4) Spec\n"
     "Rules:\n"
     "- Do NOT guess. If a value is not present, use empty string \"\".\n"
     "- Return a single JSON object with key 'welds'. No comments.\n"
@@ -129,6 +129,7 @@ def call_vision(images: List[Image.Image], model_name: str) -> Dict[str, List[Di
     """
     client = get_client()
     messages = build_messages(images)
+
     def _invoke():
         resp = client.chat.completions.create(
             model=model_name,
@@ -143,6 +144,7 @@ def call_vision(images: List[Image.Image], model_name: str) -> Dict[str, List[Di
         rows = [clean_row(x) for x in data["welds"]]
         rows = dedupe_by_weld_number(rows)
         return {"welds": rows}
+
     return with_retries(_invoke, attempts=3, base_delay=1.0)
 
 # -----------------------------
@@ -153,9 +155,11 @@ WANT_COLS = ["Weld Number", "Shop/Field", "Weld Size", "Spec"]
 def to_table(result_json: Dict[str, List[Dict]]) -> pd.DataFrame:
     rows = result_json.get("welds", [])
     df = pd.DataFrame(rows, columns=WANT_COLS)
+    # Coerce types/trims again, just in case
     for c in ["Weld Number", "Weld Size", "Spec"]:
         df[c] = df[c].astype(str).str.strip()
     df["Shop/Field"] = df["Shop/Field"].apply(normalize_shop_field)
+    # sort by Weld Number if possible
     if "Weld Number" in df.columns:
         try:
             df = df.sort_values("Weld Number", key=lambda s: s.astype(str))
@@ -190,6 +194,7 @@ def compare_with_excel(extracted_df: pd.DataFrame, excel_df: pd.DataFrame) -> Tu
     gt = normalize_columns(excel_df).dropna(how="all")
     gt = gt[gt["Weld Number"] != ""].drop_duplicates(subset=["Weld Number"])
     ex = normalize_columns(extracted_df).drop_duplicates(subset=["Weld Number"])
+
     merged = gt.merge(ex, on="Weld Number", how="left", suffixes=("_GT", "_EX"))
     rows = []
     for _, r in merged.iterrows():
@@ -241,6 +246,7 @@ if st.button("▶️ Extract 4 Fields"):
     if not page_images:
         st.error("No pages found in the PDF.")
         st.stop()
+
     st.success(f"Rendered {len(page_images)} page(s).")
 
     with st.spinner("Extracting welds with GPT Vision…"):
@@ -279,16 +285,3 @@ with st.expander("How to set your API key in Streamlit Cloud"):
 **Where to click:**
 1. In the top-right of your deployed app page click **⋮ (three dots)** → **Settings** → **Secrets**.
 2. Paste:
-```
-OPENAI_API_KEY = "sk-..."
-```
-3. **Save**, then **⋮ → Reboot** the app.
-
-**Notes**
-- Uses new SDK: `from openai import OpenAI` → `client.chat.completions.create(...)`.
-- `response_format={"type": "json_object"}` forces valid JSON.
-- Temperature = 0 to avoid hallucinations.
-- Normalises: `SW/S/W → Shop`, `FW/F/W → Field`.
-- Missing data → "" (never guessed).
-        """
-    )
