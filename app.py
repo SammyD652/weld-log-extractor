@@ -17,13 +17,10 @@ def get_openai_api_key():
     global OPENAI_KEY
     if OPENAI_KEY:
         return OPENAI_KEY
-    # 1) Streamlit Secrets
     if hasattr(st, "secrets"):
         OPENAI_KEY = st.secrets.get("OPENAI_API_KEY", None)
-    # 2) Env var
     if not OPENAI_KEY:
         OPENAI_KEY = os.getenv("OPENAI_API_KEY", None)
-    # 3) Sidebar prompt
     if not OPENAI_KEY:
         with st.sidebar:
             st.markdown("### OpenAI API Key")
@@ -76,7 +73,7 @@ def pil_to_b64(img: Image.Image, quality: int = 85) -> str:
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 # -----------------------------
-# 4) Vision prompt (CLOSED properly!)
+# 4) Vision prompt
 # -----------------------------
 SYSTEM_PROMPT = """
 You are an expert welding QA/QC document reader.
@@ -93,8 +90,7 @@ TASK: Extract a weld list with ONLY these fields:
 
 RULES:
 - Output EXACTLY what's visible. No hallucinations.
-- If reading an isometric, weld numbers are the tags near joints; only return those that are legible.
-- If any field is missing/illegible, use empty string "" for that field, but include the weld if the weld_number is present.
+- If any field is missing/illegible, use "" for that field, but include the weld if the weld_number is present.
 
 Return JSON only in this schema:
 {"welds":[
@@ -103,35 +99,56 @@ Return JSON only in this schema:
 """
 
 # -----------------------------
-# 5) Call GPT-4o via chat.completions (OpenAI 1.x)
+# 5) Call GPT-4o (Chat Completions with image_url parts)
 # -----------------------------
 def call_vision(images: List[Image.Image], model_name: str) -> Dict[str, Any]:
-    # Build a single user message with multiple parts (text + all images).
-    parts = [{"type": "input_text", "text": "Extract only the 4 fields as per instructions and return JSON."}]
+    # Chat Completions requires content parts of type "text" and "image_url"
+    parts = [{"type": "text", "text": "Extract only the 4 fields as per instructions and return JSON."}]
     for img in images:
         parts.append({
-            "type": "input_image",
+            "type": "image_url",
             "image_url": {"url": f"data:image/jpeg;base64,{pil_to_b64(img)}"}
         })
 
-    resp = client.chat.completions.create(
-        model=model_name,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": parts},
-        ],
-        temperature=0,
-    )
-    text = resp.choices[0].message.content or ""
+    try:
+        resp = client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": parts},
+            ],
+            temperature=0,
+        )
+        text = resp.choices[0].message.content or ""
+    except Exception as e:
+        # Fallback: Responses API (works with "input_image")
+        try:
+            img_parts = [
+                {"type": "input_image", "image_url": f"data:image/jpeg;base64,{pil_to_b64(img)}"}
+                for img in images
+            ]
+            resp2 = client.responses.create(
+                model=model_name,
+                input=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": [{"type": "input_text", "text": "Extract JSON only."}] + img_parts},
+                ],
+                temperature=0,
+                response_format={"type": "json_object"},
+            )
+            text = resp2.output_text
+        except Exception:
+            text = ""
 
-    # Try parse JSON
+    # Try parse JSON directly
     try:
         data = json.loads(text)
         if "welds" in data and isinstance(data["welds"], list):
             return data
     except Exception:
         pass
-    # Fallback: try to find JSON block in text
+
+    # Last resort: find JSON block inside text
     try:
         start = text.find("{")
         end = text.rfind("}")
@@ -141,6 +158,7 @@ def call_vision(images: List[Image.Image], model_name: str) -> Dict[str, Any]:
                 return data
     except Exception:
         pass
+
     return {"welds": []}
 
 # -----------------------------
