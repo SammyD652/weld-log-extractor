@@ -1,5 +1,6 @@
 import io
 import os
+import re
 import base64
 import json
 from typing import List, Dict, Any, Tuple
@@ -18,13 +19,10 @@ def get_openai_api_key():
     global OPENAI_KEY
     if OPENAI_KEY:
         return OPENAI_KEY
-    # 1) Streamlit Secrets
     if hasattr(st, "secrets"):
         OPENAI_KEY = st.secrets.get("OPENAI_API_KEY", None)
-    # 2) Environment variable
     if not OPENAI_KEY:
         OPENAI_KEY = os.getenv("OPENAI_API_KEY", None)
-    # 3) Sidebar input fallback
     if not OPENAI_KEY:
         with st.sidebar:
             st.markdown("### OpenAI API Key")
@@ -75,7 +73,7 @@ def pil_to_b64(img: Image.Image, quality: int = 85) -> str:
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 # -----------------------------
-# 4) Vision prompt (strict, closes properly)
+# 4) Vision prompt (strict)
 # -----------------------------
 SYSTEM_PROMPT = '''
 You are an expert welding QA/QC document reader.
@@ -92,22 +90,26 @@ TASK: Extract a weld list with ONLY these fields:
 - weld_size: the joint size (e.g., 25mm, DN25, 1"). If size cannot be definitively tied to a weld, use "" (no guessing).
 - spec: the pipeline spec (e.g., CSJ, CSDN15). If a single global spec clearly applies to all welds on the sheet, you may apply it; otherwise use "".
 
-RULES:
-- Never guess weld numbers. Only extract what is actually on the drawing/log.
-- Never classify as Field unless "FW" (or equivalent) is clearly shown.
+CRITICAL RULES:
+- DO NOT expand/assume ranges (e.g., "W01–W50"). Only return welds you can literally read, one by one.
+- DO NOT invent missing fields. Use "" for unknowns.
+- Never classify as Field unless "FW/F/W/Field" is clearly printed near that weld tag.
 - If uncertain about shop_or_field, default to "Shop".
 
 Return JSON only in this schema:
 {"welds":[
   {"weld_number":"...", "shop_or_field":"Shop|Field", "weld_size":"...", "spec":"..."}
 ]}
+
+Additional constraints:
+- A weld_number must look like a tag such as W1, W01, W123 (letter W followed by digits).
+- If you are not sure the text is a weld tag, do not include it.
 '''
 
 # -----------------------------
 # 5) Call GPT-4o (Chat Completions with image_url parts)
 # -----------------------------
 def call_vision(images: List[Image.Image], model_name: str) -> Dict[str, Any]:
-    # Chat Completions expects parts of type "text" and "image_url"
     parts = [{"type": "text", "text": "Extract only the 4 fields and return JSON exactly as specified."}]
     for img in images:
         parts.append({
@@ -127,7 +129,7 @@ def call_vision(images: List[Image.Image], model_name: str) -> Dict[str, Any]:
         )
         text = resp.choices[0].message.content or ""
     except Exception:
-        # Fallback: responses API (if ever needed)
+        # Fallback: responses API (kept for robustness)
         try:
             alt_parts = [{"type": "input_text", "text": "Extract JSON only."}]
             for img in images:
@@ -149,7 +151,6 @@ def call_vision(images: List[Image.Image], model_name: str) -> Dict[str, Any]:
             if attempt == 0:
                 data = json.loads(text)
             else:
-                # find JSON block inside text if any
                 start, end = text.find("{"), text.rfind("}")
                 if start != -1 and end != -1 and end > start:
                     data = json.loads(text[start:end+1])
@@ -162,8 +163,10 @@ def call_vision(images: List[Image.Image], model_name: str) -> Dict[str, Any]:
     return {"welds": []}
 
 # -----------------------------
-# 6) Normalisation + table
+# 6) Normalisation + validation + table
 # -----------------------------
+WELD_TAG_RE = re.compile(r"^[Ww]\d{1,4}$")  # W1..W9999
+
 def normalise_shop_field(val: str) -> str:
     if not val:
         return ""
@@ -174,20 +177,45 @@ def normalise_shop_field(val: str) -> str:
         return "Field"
     return str(val).strip().title()
 
+def is_valid_weld_number(s: str) -> bool:
+    if not s:
+        return False
+    s = s.strip()
+    return bool(WELD_TAG_RE.match(s))
+
 def to_table(data: Dict[str, Any]) -> pd.DataFrame:
     rows = []
     for w in data.get("welds", []):
         wn = str(w.get("weld_number", "")).strip()
-        if not wn:
-            continue
+        if not is_valid_weld_number(wn):
+            continue  # discard anything not like W01/W1/W123
         rows.append({
-            "Weld Number": wn,
+            "Weld Number": wn.upper(),
             "Shop / Field": normalise_shop_field(w.get("shop_or_field", "")),
             "Weld Size": str(w.get("weld_size", "")).strip(),
             "Spec": str(w.get("spec", "")).strip(),
         })
+
     df = pd.DataFrame(rows).drop_duplicates()
-    return df.reset_index(drop=True)
+    if df.empty:
+        return df
+
+    # Safety cap: if way too many welds, assume hallucination and keep most plausible subset
+    MAX_WELDS = 50
+    if len(df) > MAX_WELDS:
+        st.warning(f"Model returned {len(df)} welds which is unusually high. Keeping the first {MAX_WELDS} valid tags.")
+        # Prefer rows that have any non-empty extra field first
+        df["_score"] = (df["Weld Size"].astype(str).str.len() > 0).astype(int) + (df["Spec"].astype(str).str.len() > 0).astype(int)
+        df = df.sort_values(["_score", "Weld Number"], ascending=[False, True]).head(MAX_WELDS).drop(columns=["_score"])
+
+    # Sort by numeric part of the tag if possible
+    def tag_num(s: str) -> int:
+        try:
+            return int(re.sub(r"^[Ww]", "", s))
+        except Exception:
+            return 10**9
+    df = df.sort_values(by="Weld Number", key=lambda s: s.map(tag_num)).reset_index(drop=True)
+    return df
 
 # -----------------------------
 # 7) Optional: read Excel truth & compare
@@ -209,7 +237,7 @@ def read_truth_excel(xls_bytes: bytes) -> pd.DataFrame:
     keep = [c for c in ["Weld Number", "Shop / Field", "Weld Size", "Spec"] if c in df.columns]
     df = df[keep].copy()
     if "Weld Number" in df.columns:
-        df["Weld Number"] = df["Weld Number"].apply(lambda x: str(x).strip().replace(".0", ""))
+        df["Weld Number"] = df["Weld Number"].apply(lambda x: str(x).strip().upper().replace(".0", ""))
     if "Shop / Field" in df.columns:
         df["Shop / Field"] = df["Shop / Field"].apply(normalise_shop_field)
     for c in ("Weld Size", "Spec"):
