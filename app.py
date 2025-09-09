@@ -287,24 +287,25 @@ if go:
     else:
         st.info("Tip: Upload your Excel to see ✓/× comparisons here.")
 
-st.markdown("---")
-wiwith st.expander("How to set your API key in Streamlit Cloud"):
-        st.markdown(
-            """
+stst.markdown("---")
+with st.expander("How to set your API key in Streamlit Cloud"):
+    sst.markdown("---")
+with st.expander("How to set your API key in Streamlit Cloud"):
+    st.markdown(
+        """
 **Where to click:**
-1. In the top-right of your deployed app page click **\u22EE (three dots)** \u2192 **Settings** \u2192 **Secrets**.
+1. In the top-right of your deployed app page click **\u22ee (three dots)** → **Settings** → **Secrets**.
 2. Paste:
 ```
 OPENAI_API_KEY = "sk-..."
 ```
-3. **Save**, then **\u22EE \u2192 Reboot** the app.
+3. **Save**, then **\u22ee → Reboot** the app.
 
 **Notes**
-- Uses new SDK: `from openai import OpenAI` \u2192 `client.chat.completions.create(...)`.
+- Uses new SDK: `from openai import OpenAI` → `client.chat.completions.create(...)`.
 - `response_format={"type": "json_object"}` forces valid JSON.
 - Temperature = 0 to avoid hallucinations.
-- Normalises: `SW/S/W \u2192 Shop`, `FW/F/W \u2192 Field`.
-- Missing data \u2192 `""` (never guessed).
-            """
-        ))1. In the top-right of your deployed app page click **⋮ (three dots)** → **Settings** → **Secrets**.
-2. Paste:
+- Normalises: `SW/S/W → Shop`, `FW/F/W → Field`.
+- Missing data → `""` (never guessed).
+        """
+    )
