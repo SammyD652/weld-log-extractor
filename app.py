@@ -1,287 +1,271 @@
 import io
-import json
+import os
 import base64
-import time
-from typing import Dict, List, Tuple
+import json
+from typing import List, Dict, Any, Tuple
 
 import streamlit as st
 import pandas as pd
 from PIL import Image
 import pypdfium2 as pdfium
-from openai import OpenAI
-
-
-# =========================
-# Page config
-# =========================
-st.set_page_config(page_title="Weld Log Extraction – 4 fields", layout="wide")
-st.title("🔧 Weld Log Extraction (PDF → Weld Number, Shop/Field, Weld Size, Spec)")
 
 # -----------------------------
-# 1) OpenAI client (key from secrets only)
+# 1) OPENAI (>=1.x) CLIENT
 # -----------------------------
-def get_client() -> OpenAI:
-    key = st.secrets.get("OPENAI_API_KEY")
-    if not key:
-        st.error("Missing `OPENAI_API_KEY` in Streamlit Secrets. Click ⋮ → Settings → Secrets.")
+OPENAI_KEY = None
+def get_openai_api_key():
+    global OPENAI_KEY
+    if OPENAI_KEY:
+        return OPENAI_KEY
+    # 1) Streamlit Secrets
+    if hasattr(st, "secrets"):
+        OPENAI_KEY = st.secrets.get("OPENAI_API_KEY", None)
+    # 2) Env var
+    if not OPENAI_KEY:
+        OPENAI_KEY = os.getenv("OPENAI_API_KEY", None)
+    # 3) Sidebar prompt
+    if not OPENAI_KEY:
+        with st.sidebar:
+            st.markdown("### OpenAI API Key")
+            OPENAI_KEY = st.text_input(
+                "Enter your OpenAI API key",
+                type="password",
+                help="Tip: put it in Streamlit → Settings → Secrets as OPENAI_API_KEY to avoid typing again."
+            )
+    if not OPENAI_KEY:
         st.stop()
-    return OpenAI(api_key=key)
+    return OPENAI_KEY
+
+get_openai_api_key()
+
+from openai import OpenAI
+client = OpenAI(api_key=OPENAI_KEY)
 
 # -----------------------------
-# 2) PDF → images (PIL) via pypdfium2
+# 2) PAGE / SIDEBAR
 # -----------------------------
-def pdf_bytes_to_images(pdf_bytes: bytes, scale: float = 2.0) -> List[Image.Image]:
-    """
-    Render each page to a PIL image using pypdfium2.
-    """
-    images: List[Image.Image] = []
+st.set_page_config(page_title="Weld Log Extraction – Focused 4 Fields", layout="wide")
+st.title("Weld Log Extraction – Focused 4 Fields")
+
+with st.sidebar:
+    st.header("Settings")
+    model = st.selectbox(
+        "Model",
+        ["gpt-4o", "gpt-4o-mini"],
+        index=0,
+        help="Use gpt-4o for best accuracy."
+    )
+    render_scale = st.slider("PDF render scale (clarity vs speed)", 1.5, 3.0, 2.5, 0.1)
+    st.caption("If small tags are missed, increase scale to 2.5–3.0 and re-run.")
+
+# -----------------------------
+# 3) PDF → images
+# -----------------------------
+def pdf_bytes_to_images(pdf_bytes: bytes, scale: float = 2.5) -> List[Image.Image]:
+    imgs: List[Image.Image] = []
     pdf = pdfium.PdfDocument(io.BytesIO(pdf_bytes))
     for i in range(len(pdf)):
         page = pdf[i]
         pil = page.render(scale=scale).to_pil()
-        images.append(pil.convert("RGB"))
-    return images
+        imgs.append(pil.convert("RGB"))
+    return imgs
 
-def pil_to_base64_png(img: Image.Image) -> str:
+def pil_to_b64(img: Image.Image, quality: int = 85) -> str:
     buf = io.BytesIO()
-    img.save(buf, format="PNG", optimize=True)
+    img.save(buf, format="JPEG", quality=quality, optimize=True)
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 # -----------------------------
-# 3) Normalisation / cleaning
+# 4) Vision prompt (CLOSED properly!)
 # -----------------------------
-def normalize_shop_field(val: str) -> str:
-    """
-    Map SW/S/W/S.W./S-W → Shop; FW/F/W/F.W./F-W → Field.
-    Empty or unknown → "" (never guess).
-    """
-    if not isinstance(val, str):
+SYSTEM_PROMPT = """
+You are an expert welding QA/QC document reader.
+
+You will be given one or more page images from either:
+ - a mechanical isometric drawing, OR
+ - a typed daily weld log.
+
+TASK: Extract a weld list with ONLY these fields:
+- weld_number: the weld identifier (exactly as shown). If not visible, DO NOT invent it.
+- shop_or_field: "Shop" or "Field". Map any of {SW, S/W, Shop} → "Shop". Map {FW, F/W, Field} → "Field". If unknown, use "".
+- weld_size: the joint size (e.g., 25mm, DN25, 1"). If size cannot be definitively tied to a weld, use "" (no guessing).
+- spec: the pipeline spec (e.g., CSJ, CSDN15). If a single global spec clearly applies to all welds on the sheet, you may apply it; otherwise use "".
+
+RULES:
+- Output EXACTLY what's visible. No hallucinations.
+- If reading an isometric, weld numbers are the tags near joints; only return those that are legible.
+- If any field is missing/illegible, use empty string "" for that field, but include the weld if the weld_number is present.
+
+Return JSON only in this schema:
+{"welds":[
+  {"weld_number":"...", "shop_or_field":"Shop|Field|", "weld_size":"...", "spec":"..."}
+]}
+"""
+
+# -----------------------------
+# 5) Call GPT-4o via chat.completions (OpenAI 1.x)
+# -----------------------------
+def call_vision(images: List[Image.Image], model_name: str) -> Dict[str, Any]:
+    # Build a single user message with multiple parts (text + all images).
+    parts = [{"type": "input_text", "text": "Extract only the 4 fields as per instructions and return JSON."}]
+    for img in images:
+        parts.append({
+            "type": "input_image",
+            "image_url": {"url": f"data:image/jpeg;base64,{pil_to_b64(img)}"}
+        })
+
+    resp = client.chat.completions.create(
+        model=model_name,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": parts},
+        ],
+        temperature=0,
+    )
+    text = resp.choices[0].message.content or ""
+
+    # Try parse JSON
+    try:
+        data = json.loads(text)
+        if "welds" in data and isinstance(data["welds"], list):
+            return data
+    except Exception:
+        pass
+    # Fallback: try to find JSON block in text
+    try:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            data = json.loads(text[start:end+1])
+            if "welds" in data and isinstance(data["welds"], list):
+                return data
+    except Exception:
+        pass
+    return {"welds": []}
+
+# -----------------------------
+# 6) Normalisation + table
+# -----------------------------
+def normalise_shop_field(val: str) -> str:
+    if not val:
         return ""
-    s = val.strip().upper().replace(".", "").replace("-", "").replace("_", "")
-    if s in {"S", "SW", "W", "SHOP", "S/W"}:
+    v = str(val).strip().lower()
+    if v in ("shop", "sw", "s/w"):
         return "Shop"
-    if s in {"F", "FW", "FIELD", "F/W"}:
+    if v in ("field", "fw", "f/w"):
         return "Field"
-    return ""
+    return str(val).strip().title()
 
-def clean_row(rec: Dict) -> Dict:
-    return {
-        "Weld Number": str(rec.get("Weld Number", "") or "").strip(),
-        "Shop/Field": normalize_shop_field(rec.get("Shop/Field", "")),
-        "Weld Size": str(rec.get("Weld Size", "") or "").strip(),
-        "Spec": str(rec.get("Spec", "") or "").strip(),
-    }
-
-def dedupe_by_weld_number(rows: List[Dict]) -> List[Dict]:
-    seen = set()
-    out = []
-    for r in rows:
-        wn = r.get("Weld Number", "")
-        if wn not in seen:
-            out.append(r)
-            seen.add(wn)
-    return out
-
-# -----------------------------
-# 4) OpenAI Vision (chat.completions with JSON forcing)
-# -----------------------------
-SYSTEM_PROMPT = (
-    "You are a meticulous extraction engine for welding documents. "
-    "Extract ONLY what is explicitly visible. If a field is not visible, return an empty string. "
-    "Output must be valid JSON with the schema:\n"
-    "{ 'welds': [ { 'Weld Number': str, 'Shop/Field': str, 'Weld Size': str, 'Spec': str } ] }"
-)
-
-USER_RULES = (
-    "From these isometric drawing pages, extract a table with EXACTLY these 4 fields:\n"
-    "1) Weld Number\n2) Shop/Field (normalize SW/S/W → 'Shop', FW/F/W → 'Field')\n"
-    "3) Weld Size\n4) Spec\n"
-    "Rules:\n"
-    "- Do NOT guess. If a value is not present, use empty string \"\".\n"
-    "- Return a single JSON object with key 'welds'. No comments.\n"
-    "- Avoid duplicates (same Weld Number).\n"
-)
-
-def build_messages(page_images: List[Image.Image]) -> List[Dict]:
-    user_parts: List[Dict] = [{"type": "text", "text": USER_RULES}]
-    for im in page_images:
-        user_parts.append(
-            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{pil_to_base64_png(im)}"}}
-        )
-    return [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": user_parts},
-    ]
-
-def with_retries(fn, attempts=3, base_delay=1.2):
-    last = None
-    for i in range(attempts):
-        try:
-            return fn()
-        except Exception as e:
-            last = e
-            time.sleep(base_delay * (2 ** i))
-    raise last
-
-def call_vision(images: List[Image.Image], model_name: str) -> Dict[str, List[Dict]]:
-    """
-    Send images to GPT-4o/4o-mini using chat.completions and get JSON back.
-    """
-    client = get_client()
-    messages = build_messages(images)
-
-    def _invoke():
-        resp = client.chat.completions.create(
-            model=model_name,
-            temperature=0,
-            response_format={"type": "json_object"},
-            messages=messages,
-        )
-        content = resp.choices[0].message.content
-        data = json.loads(content)
-        if not isinstance(data, dict) or "welds" not in data or not isinstance(data["welds"], list):
-            raise ValueError("Unexpected JSON format (missing 'welds' list).")
-        rows = [clean_row(x) for x in data["welds"]]
-        rows = dedupe_by_weld_number(rows)
-        return {"welds": rows}
-
-    return with_retries(_invoke, attempts=3, base_delay=1.0)
-
-# -----------------------------
-# 5) Table + comparison
-# -----------------------------
-WANT_COLS = ["Weld Number", "Shop/Field", "Weld Size", "Spec"]
-
-def to_table(result_json: Dict[str, List[Dict]]) -> pd.DataFrame:
-    rows = result_json.get("welds", [])
-    df = pd.DataFrame(rows, columns=WANT_COLS)
-    # Coerce types/trims again, just in case
-    for c in ["Weld Number", "Weld Size", "Spec"]:
-        df[c] = df[c].astype(str).str.strip()
-    df["Shop/Field"] = df["Shop/Field"].apply(normalize_shop_field)
-    # sort by Weld Number if possible
-    if "Weld Number" in df.columns:
-        try:
-            df = df.sort_values("Weld Number", key=lambda s: s.astype(str))
-        except Exception:
-            pass
+def to_table(data: Dict[str, Any]) -> pd.DataFrame:
+    rows = []
+    for w in data.get("welds", []):
+        wn = str(w.get("weld_number", "")).strip()
+        if not wn:
+            continue
+        rows.append({
+            "Weld Number": wn,
+            "Shop / Field": normalise_shop_field(w.get("shop_or_field", "")),
+            "Weld Size": str(w.get("weld_size", "")).strip(),
+            "Spec": str(w.get("spec", "")).strip(),
+        })
+    df = pd.DataFrame(rows).drop_duplicates()
     return df.reset_index(drop=True)
 
-def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    col_map = {}
-    for c in df.columns:
-        cu = c.strip().lower()
-        if "weld" in cu and "number" in cu:
-            col_map[c] = "Weld Number"
-        elif "shop" in cu or "field" in cu:
-            col_map[c] = "Shop/Field"
-        elif "size" in cu or "nd" in cu:
-            col_map[c] = "Weld Size"
-        elif "spec" in cu:
-            col_map[c] = "Spec"
-    d2 = df.rename(columns=col_map).copy()
-    for need in WANT_COLS:
-        if need not in d2.columns:
-            d2[need] = ""
-    d2 = d2[WANT_COLS]
-    d2["Weld Number"] = d2["Weld Number"].astype(str).str.strip()
-    d2["Weld Size"] = d2["Weld Size"].astype(str).str.strip()
-    d2["Spec"] = d2["Spec"].astype(str).str.strip()
-    d2["Shop/Field"] = d2["Shop/Field"].apply(normalize_shop_field)
-    return d2
+# -----------------------------
+# 7) Optional: read Excel truth & compare
+# -----------------------------
+def read_truth_excel(xls_bytes: bytes) -> pd.DataFrame:
+    xls = pd.ExcelFile(io.BytesIO(xls_bytes))
+    df = pd.read_excel(xls, sheet_name=0)
+    df.columns = [c.strip() for c in df.columns]
+    rename = {
+        "Weld No.": "Weld Number",
+        "Weld No": "Weld Number",
+        "Weld_Number": "Weld Number",
+        "Shop / Field": "Shop / Field",
+        "Pipe Size": "Weld Size",
+        "Spec.": "Spec",
+        "Spec": "Spec",
+    }
+    df = df.rename(columns={k: v for k, v in rename.items() if k in df.columns})
+    keep = [c for c in ["Weld Number", "Shop / Field", "Weld Size", "Spec"] if c in df.columns]
+    df = df[keep].copy()
+    if "Weld Number" in df.columns:
+        df["Weld Number"] = df["Weld Number"].apply(lambda x: str(x).strip().replace(".0", ""))
+    if "Shop / Field" in df.columns:
+        df["Shop / Field"] = df["Shop / Field"].apply(normalise_shop_field)
+    for c in ("Weld Size", "Spec"):
+        if c in df.columns:
+            df[c] = df[c].apply(lambda x: "" if pd.isna(x) else str(x).strip())
+    return df.dropna(how="all")
 
-def compare_with_excel(extracted_df: pd.DataFrame, excel_df: pd.DataFrame) -> Tuple[pd.DataFrame, float]:
-    gt = normalize_columns(excel_df).dropna(how="all")
-    gt = gt[gt["Weld Number"] != ""].drop_duplicates(subset=["Weld Number"])
-    ex = normalize_columns(extracted_df).drop_duplicates(subset=["Weld Number"])
-
-    merged = gt.merge(ex, on="Weld Number", how="left", suffixes=("_GT", "_EX"))
-    rows = []
-    for _, r in merged.iterrows():
-        rows.append({
-            "Weld Number": r["Weld Number"],
-            "Shop/Field ✓?": "✓" if (r["Shop/Field_GT"] or "") == (r["Shop/Field_EX"] or "") else "×",
-            "Weld Size ✓?": "✓" if (r["Weld Size_GT"] or "") == (r["Weld Size_EX"] or "") else "×",
-            "Spec ✓?": "✓" if (r["Spec_GT"] or "") == (r["Spec_EX"] or "") else "×",
-            "Shop/Field (GT)": r["Shop/Field_GT"] or "",
-            "Shop/Field (EX)": r.get("Shop/Field_EX", "") or "",
-            "Weld Size (GT)": r["Weld Size_GT"] or "",
-            "Weld Size (EX)": r.get("Weld Size_EX", "") or "",
-            "Spec (GT)": r["Spec_GT"] or "",
-            "Spec (EX)": r.get("Spec_EX", "") or "",
-        })
-    cmp_df = pd.DataFrame(rows)
-    total = max(1, 3 * len(cmp_df))
-    correct = (cmp_df["Shop/Field ✓?"] == "✓").sum() + (cmp_df["Weld Size ✓?"] == "✓").sum() + (cmp_df["Spec ✓?"] == "✓").sum()
-    return cmp_df, correct / total
+def compare(pred: pd.DataFrame, truth: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, float]]:
+    if pred.empty or truth.empty:
+        return pd.DataFrame(), {}
+    merged = truth.merge(pred, on="Weld Number", how="left", suffixes=(" (truth)", " (pred)"))
+    stats = {}
+    for col in ["Shop / Field", "Weld Size", "Spec"]:
+        t, p = f"{col} (truth)", f"{col} (pred)"
+        if t in merged.columns and p in merged.columns:
+            hit = (merged[t].fillna("") == merged[p].fillna(""))
+            merged[f"{col} ✓"] = hit.map({True: "✓", False: "×"})
+            stats[col] = round(100.0 * hit.mean(), 1)
+    return merged, stats
 
 # -----------------------------
-# 6) Sidebar + UI
+# 8) UI – uploads
 # -----------------------------
-with st.sidebar:
-    st.header("Settings")
-    model = st.selectbox(
-        "Vision model",
-        options=["gpt-4o-mini", "gpt-4o"],
-        index=0,
-        help="Use gpt-4o for best accuracy if drawings are dense.",
-    )
-    scale = st.slider("PDF render scale", 1.5, 3.0, 2.0, 0.1)
-    st.caption("Increase if small tags are missed. Larger scale = clearer but slower.")
+st.subheader("1) Upload PDF(s)")
+pdfs = st.file_uploader("Drop one or more PDFs (isometrics or weld logs)", type=["pdf"], accept_multiple_files=True)
 
-uploaded_pdf = st.file_uploader("Upload one isometric PDF", type=["pdf"])
-uploaded_excel = st.file_uploader("(Optional) Upload ground-truth Excel (e.g., 2063 Excel Weld log.xlsx)", type=["xlsx", "xls"])
+st.subheader("2) (Optional) Upload Ground Truth Excel")
+truth_file = st.file_uploader("Drop your Excel containing the 4 fields", type=["xlsx", "xls"])
 
-if st.button("▶️ Extract 4 Fields"):
-    if not uploaded_pdf:
-        st.warning("Please upload a PDF first.")
+run = st.button("Run Extraction", type="primary", use_container_width=True)
+
+# -----------------------------
+# 9) Main
+# -----------------------------
+if run:
+    if not pdfs:
+        st.warning("Please upload at least one PDF.")
         st.stop()
 
-    st.info("Rendering PDF pages…")
-    try:
-        page_images = pdf_bytes_to_images(uploaded_pdf.read(), scale=scale)
-    except Exception as e:
-        st.error(f"Failed to render PDF: {e}")
-        st.stop()
-    if not page_images:
-        st.error("No pages found in the PDF.")
-        st.stop()
+    all_imgs: List[Image.Image] = []
+    with st.spinner("Rendering PDF pages…"):
+        for f in pdfs:
+            all_imgs.extend(pdf_bytes_to_images(f.read(), scale=render_scale))
+    st.success(f"Rendered {len(all_imgs)} page image(s).")
 
-    st.success(f"Rendered {len(page_images)} page(s).")
+    with st.spinner("Extracting welds with GPT-4o…"):
+        result = call_vision(all_imgs, model)
+    df_pred = to_table(result)
 
-    with st.spinner("Extracting welds with GPT Vision…"):
-        result_json = call_vision(page_images, model)
-
-    df = to_table(result_json)
-    st.subheader("Extracted Weld Log (4 fields)")
-    st.dataframe(df, use_container_width=True, hide_index=True)
-
-    st.download_button(
-        "Download Extracted CSV",
-        df.to_csv(index=False).encode("utf-8"),
-        "extracted_weld_log.csv",
-        "text/csv",
-    )
-
-    if uploaded_excel is not None:
-        st.markdown("---")
-        st.subheader("Comparison vs Ground Truth (✓/× per field)")
-        try:
-            gt_df = pd.read_excel(uploaded_excel)
-        except Exception as e:
-            st.error(f"Could not read the Excel file: {e}")
-            st.stop()
-        cmp_df, acc = compare_with_excel(df, gt_df)
-        st.dataframe(cmp_df, use_container_width=True, hide_index=True)
-        st.metric("Field-level Accuracy", f"{acc*100:.1f}%")
-        st.caption("✓ means exact match with the Excel value for that Weld Number. Missing data is ''.")
+    st.subheader("Results")
+    if df_pred.empty:
+        st.error("No welds found. Increase PDF render scale (2.5–3.0) and re-run.")
     else:
-        st.info("Tip: Upload your Excel to see ✓/× comparisons here.")
+        st.dataframe(df_pred, use_container_width=True)
 
-st.markdown("---")
-with st.expander("How to set your API key in Streamlit Cloud"):
-    st.markdown(
-        """
-**Where to click:**
-1. In the top-right of your deployed app page click **⋮ (three dots)** → **Settings** → **Secrets**.
-2. Paste:
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
+            df_pred.to_excel(w, index=False, sheet_name="Weld Log (4 fields)")
+        st.download_button(
+            "Download Excel",
+            data=buf.getvalue(),
+            file_name="weld_log_4fields.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True
+        )
+
+    if truth_file and not df_pred.empty:
+        st.subheader("Accuracy Check (vs. your Excel)")
+        df_truth = read_truth_excel(truth_file.read())
+        if df_truth.empty:
+            st.warning("Could not detect expected columns in your Excel.")
+        else:
+            comp, stats = compare(df_pred, df_truth)
+            if stats:
+                st.write(f"**Match Rates** – Shop/Field: {stats.get('Shop / Field',0)}% | "
+                         f"Weld Size: {stats.get('Weld Size',0)}% | Spec: {stats.get('Spec',0)}%")
+            st.dataframe(comp, use_container_width=True)
