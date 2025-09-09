@@ -8,34 +8,36 @@ import streamlit as st
 import pandas as pd
 from PIL import Image
 import pypdfium2 as pdfium
+from openai import OpenAI
 
 # -----------------------------
-# 1) OPENAI (>=1.x) CLIENT
+# 1) OPENAI KEY (no retyping)
 # -----------------------------
 OPENAI_KEY = None
 def get_openai_api_key():
     global OPENAI_KEY
     if OPENAI_KEY:
         return OPENAI_KEY
+    # 1) Streamlit Secrets
     if hasattr(st, "secrets"):
         OPENAI_KEY = st.secrets.get("OPENAI_API_KEY", None)
+    # 2) Environment variable
     if not OPENAI_KEY:
         OPENAI_KEY = os.getenv("OPENAI_API_KEY", None)
+    # 3) Sidebar input fallback
     if not OPENAI_KEY:
         with st.sidebar:
             st.markdown("### OpenAI API Key")
             OPENAI_KEY = st.text_input(
                 "Enter your OpenAI API key",
                 type="password",
-                help="Tip: put it in Streamlit → Settings → Secrets as OPENAI_API_KEY to avoid typing again."
+                help="Tip: put it once in Streamlit → Settings → Secrets as OPENAI_API_KEY."
             )
     if not OPENAI_KEY:
         st.stop()
     return OPENAI_KEY
 
 get_openai_api_key()
-
-from openai import OpenAI
 client = OpenAI(api_key=OPENAI_KEY)
 
 # -----------------------------
@@ -53,10 +55,10 @@ with st.sidebar:
         help="Use gpt-4o for best accuracy."
     )
     render_scale = st.slider("PDF render scale (clarity vs speed)", 1.5, 3.0, 2.5, 0.1)
-    st.caption("If small tags are missed, increase scale to 2.5–3.0 and re-run.")
+    st.caption("If small tags are missed, increase to 2.5–3.0 and re-run.")
 
 # -----------------------------
-# 3) PDF → images
+# 3) PDF → PIL images
 # -----------------------------
 def pdf_bytes_to_images(pdf_bytes: bytes, scale: float = 2.5) -> List[Image.Image]:
     imgs: List[Image.Image] = []
@@ -73,10 +75,9 @@ def pil_to_b64(img: Image.Image, quality: int = 85) -> str:
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 # -----------------------------
-# 4) Vision prompt
+# 4) Vision prompt (strict, closes properly)
 # -----------------------------
-SYSTEM_PROMPT = """
-SYSTEM_PROMPT = """
+SYSTEM_PROMPT = '''
 You are an expert welding QA/QC document reader.
 
 You will be given one or more page images from either:
@@ -93,28 +94,28 @@ TASK: Extract a weld list with ONLY these fields:
 
 RULES:
 - Never guess weld numbers. Only extract what is actually on the drawing/log.
-- Never classify as Field unless "FW" or equivalent is clearly shown.
+- Never classify as Field unless "FW" (or equivalent) is clearly shown.
 - If uncertain about shop_or_field, default to "Shop".
-- Output JSON only in this schema:
 
+Return JSON only in this schema:
 {"welds":[
   {"weld_number":"...", "shop_or_field":"Shop|Field", "weld_size":"...", "spec":"..."}
 ]}
-"""
-
+'''
 
 # -----------------------------
 # 5) Call GPT-4o (Chat Completions with image_url parts)
 # -----------------------------
 def call_vision(images: List[Image.Image], model_name: str) -> Dict[str, Any]:
-    # Chat Completions requires content parts of type "text" and "image_url"
-    parts = [{"type": "text", "text": "Extract only the 4 fields as per instructions and return JSON."}]
+    # Chat Completions expects parts of type "text" and "image_url"
+    parts = [{"type": "text", "text": "Extract only the 4 fields and return JSON exactly as specified."}]
     for img in images:
         parts.append({
             "type": "image_url",
             "image_url": {"url": f"data:image/jpeg;base64,{pil_to_b64(img)}"}
         })
 
+    # Primary path: chat.completions
     try:
         resp = client.chat.completions.create(
             model=model_name,
@@ -125,19 +126,16 @@ def call_vision(images: List[Image.Image], model_name: str) -> Dict[str, Any]:
             temperature=0,
         )
         text = resp.choices[0].message.content or ""
-    except Exception as e:
-        # Fallback: Responses API (works with "input_image")
+    except Exception:
+        # Fallback: responses API (if ever needed)
         try:
-            img_parts = [
-                {"type": "input_image", "image_url": f"data:image/jpeg;base64,{pil_to_b64(img)}"}
-                for img in images
-            ]
+            alt_parts = [{"type": "input_text", "text": "Extract JSON only."}]
+            for img in images:
+                alt_parts.append({"type": "input_image", "image_url": f"data:image/jpeg;base64,{pil_to_b64(img)}"})
             resp2 = client.responses.create(
                 model=model_name,
-                input=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": [{"type": "input_text", "text": "Extract JSON only."}] + img_parts},
-                ],
+                input=[{"role": "system", "content": SYSTEM_PROMPT},
+                       {"role": "user", "content": alt_parts}],
                 temperature=0,
                 response_format={"type": "json_object"},
             )
@@ -145,25 +143,22 @@ def call_vision(images: List[Image.Image], model_name: str) -> Dict[str, Any]:
         except Exception:
             text = ""
 
-    # Try parse JSON directly
-    try:
-        data = json.loads(text)
-        if "welds" in data and isinstance(data["welds"], list):
-            return data
-    except Exception:
-        pass
-
-    # Last resort: find JSON block inside text
-    try:
-        start = text.find("{")
-        end = text.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            data = json.loads(text[start:end+1])
-            if "welds" in data and isinstance(data["welds"], list):
+    # Parse JSON
+    for attempt in range(2):
+        try:
+            if attempt == 0:
+                data = json.loads(text)
+            else:
+                # find JSON block inside text if any
+                start, end = text.find("{"), text.rfind("}")
+                if start != -1 and end != -1 and end > start:
+                    data = json.loads(text[start:end+1])
+                else:
+                    data = {"welds": []}
+            if isinstance(data, dict) and isinstance(data.get("welds", []), list):
                 return data
-    except Exception:
-        pass
-
+        except Exception:
+            pass
     return {"welds": []}
 
 # -----------------------------
@@ -270,6 +265,7 @@ if run:
     else:
         st.dataframe(df_pred, use_container_width=True)
 
+        # Download
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
             df_pred.to_excel(w, index=False, sheet_name="Weld Log (4 fields)")
