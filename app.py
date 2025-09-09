@@ -76,6 +76,7 @@ def pil_to_b64(img: Image.Image, quality: int = 85) -> str:
 # 4) Vision prompt
 # -----------------------------
 SYSTEM_PROMPT = """
+SYSTEM_PROMPT = """
 You are an expert welding QA/QC document reader.
 
 You will be given one or more page images from either:
@@ -84,19 +85,23 @@ You will be given one or more page images from either:
 
 TASK: Extract a weld list with ONLY these fields:
 - weld_number: the weld identifier (exactly as shown). If not visible, DO NOT invent it.
-- shop_or_field: "Shop" or "Field". Map any of {SW, S/W, Shop} → "Shop". Map {FW, F/W, Field} → "Field". If unknown, use "".
+- shop_or_field:
+    * If the drawing/log explicitly marks "FW", "F/W", or "Field", return "Field".
+    * Otherwise, default to "Shop".
 - weld_size: the joint size (e.g., 25mm, DN25, 1"). If size cannot be definitively tied to a weld, use "" (no guessing).
 - spec: the pipeline spec (e.g., CSJ, CSDN15). If a single global spec clearly applies to all welds on the sheet, you may apply it; otherwise use "".
 
 RULES:
-- Output EXACTLY what's visible. No hallucinations.
-- If any field is missing/illegible, use "" for that field, but include the weld if the weld_number is present.
+- Never guess weld numbers. Only extract what is actually on the drawing/log.
+- Never classify as Field unless "FW" or equivalent is clearly shown.
+- If uncertain about shop_or_field, default to "Shop".
+- Output JSON only in this schema:
 
-Return JSON only in this schema:
 {"welds":[
-  {"weld_number":"...", "shop_or_field":"Shop|Field|", "weld_size":"...", "spec":"..."}
+  {"weld_number":"...", "shop_or_field":"Shop|Field", "weld_size":"...", "spec":"..."}
 ]}
 """
+
 
 # -----------------------------
 # 5) Call GPT-4o (Chat Completions with image_url parts)
