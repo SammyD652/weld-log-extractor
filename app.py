@@ -53,7 +53,19 @@ with st.sidebar:
         help="Use gpt-4o for best accuracy."
     )
     render_scale = st.slider("PDF render scale (clarity vs speed)", 1.5, 3.0, 3.0, 0.1)
+
     strict_crop = st.checkbox("Strict drawing-only mode (crop out title block / BOM / legends)", True)
+
+    # Crop controls (active only when strict mode is ON)
+    if strict_crop:
+        st.markdown("**Crop margins (strict mode)**")
+        left_trim   = st.slider("Left trim (%)",   0.0, 20.0, 5.0, 0.5)
+        right_trim  = st.slider("Right trim (%)",  0.0, 20.0, 5.0, 0.5)
+        top_trim    = st.slider("Top trim (%)",    0.0, 20.0, 3.0, 0.5)
+        bottom_trim = st.slider("Bottom trim (%)", 0.0, 30.0, 10.0, 0.5)
+    else:
+        left_trim = right_trim = top_trim = bottom_trim = 0.0
+
     per_sheet_cap = st.number_input("Max welds per sheet (cap)", min_value=5, max_value=200, value=25, step=5)
     show_debug = st.checkbox("Show debug cropped images", False)
     st.caption("If tags are tiny, use scale 3.0. Strict mode reduces false positives from tables/legends.")
@@ -70,18 +82,16 @@ def pdf_bytes_to_images(pdf_bytes: bytes, scale: float = 3.0) -> List[Image.Imag
         imgs.append(pil.convert("RGB"))
     return imgs
 
-def crop_to_drawing(img: Image.Image) -> Image.Image:
+def crop_to_drawing(img: Image.Image, l_pct: float, r_pct: float, t_pct: float, b_pct: float) -> Image.Image:
     """
-    Generic crop that removes common areas where title blocks/BOM/legends live.
-    Keeps the central band where the iso sketch usually is.
-    Tuned for typical DGR/D10EC isometric layouts.
+    Crop out likely title block/BOM borders using user-controlled margins.
+    Percent inputs are 0–100.
     """
     w, h = img.size
-    # Trim ~8% sides, ~5% top, and ~20% bottom (title block usually bottom-right)
-    left   = int(w * 0.08)
-    right  = int(w * 0.92)
-    top    = int(h * 0.05)
-    bottom = int(h * 0.80)
+    left   = int(w * (l_pct / 100.0))
+    right  = int(w * (1.0 - (r_pct / 100.0)))
+    top    = int(h * (t_pct / 100.0))
+    bottom = int(h * (1.0 - (b_pct / 100.0)))
     if right - left < 50 or bottom - top < 50:
         return img  # fail-safe
     return img.crop((left, top, right, bottom))
@@ -186,8 +196,7 @@ def detect_global_size(images: List[Image.Image]) -> str:
 # -----------------------------
 # 6) Normalisation + validation + table
 # -----------------------------
-# Valid weld number: W + optional hyphen + 1..4 digits; explicitly ban SW*, FW*, spaces.
-WELD_TAG_RE = re.compile(r"^W-?\d{1,4}$")
+WELD_TAG_RE = re.compile(r"^W-?\d{1,4}$")  # W + optional hyphen + 1..4 digits
 
 def normalise_shop_field(val: str) -> str:
     if not val:
@@ -300,7 +309,6 @@ if run:
         st.stop()
 
     all_results = []
-    all_imgs_debug = []
 
     for f in pdf_files:
         file_bytes = f.read()
@@ -308,10 +316,13 @@ if run:
             full_imgs = pdf_bytes_to_images(file_bytes, scale=render_scale)
 
         # Choose which images to analyze
-        imgs = [crop_to_drawing(im) for im in full_imgs] if strict_crop else full_imgs
+        if strict_crop:
+            imgs = [crop_to_drawing(im, left_trim, right_trim, top_trim, bottom_trim) for im in full_imgs]
+        else:
+            imgs = full_imgs
 
         if show_debug:
-            with st.expander(f"Debug: {f.name} ({len(imgs)} cropped page(s))"):
+            with st.expander(f"Debug: {f.name} ({len(imgs)} page(s) sent to model)"):
                 for i, im in enumerate(imgs, 1):
                     st.image(im, caption=f"{f.name} – Cropped page {i}", use_container_width=True)
 
@@ -332,7 +343,7 @@ if run:
             all_results.append(df_pred)
 
     if not all_results:
-        st.error("No welds found. Increase PDF render scale (3.0) and re-run. Try keeping Strict mode ON.")
+        st.error("No welds found. Increase PDF render scale (3.0) and re-run. If strict mode is ON, widen crop margins or turn it OFF.")
         st.stop()
 
     final_df = pd.concat(all_results, ignore_index=True)
