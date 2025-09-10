@@ -1,7 +1,7 @@
 import io
 import re
 import json
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 
 import pdfplumber
 import pandas as pd
@@ -15,7 +15,7 @@ try:
 except Exception:
     OCR_AVAILABLE = False
 
-# ---------- PDF TEXT EXTRACTION (vector text + optional OCR fallback) ----------
+# ---------- PDF TEXT EXTRACTION (vector + OCR fallback) ----------
 
 def _page_text_pdfplumber(pdf_bytes: bytes) -> List[Dict[str, Any]]:
     pages = []
@@ -36,8 +36,9 @@ def _ocr_page(pdf_bytes: bytes, page_index: int, dpi: int = 300) -> str:
     img = bitmap.convert("L")
     img = ImageOps.autocontrast(img)
     img = img.filter(ImageFilter.SHARPEN)
-    # Sparse diagrams benefit from PSM 11; we also whitelist useful chars
-    config = "-l eng --oem 3 --psm 11 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_:#"
+    # diagrams: single uniform block tends to work best
+    # - PSM 6 (assume block) usually reduces per-char lines
+    config = "-l eng --oem 3 --psm 6 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_:#"
     text = pytesseract.image_to_string(img, config=config)
     text = "\n".join(line.strip() for line in text.splitlines())
     return text
@@ -56,93 +57,108 @@ def extract_pdf_text_per_page(pdf_bytes: bytes, enable_ocr_fallback: bool = Fals
 
 # ---------- WELD ID DETECTION ----------
 
-# Base regex (works on compact strings too)
-# prefix: W / SW / BW (WELD → W)
-# number: 1-5 digits possibly with a trailing letter (A-Z)
+# Base regex on compacted strings.
 BASE = re.compile(r"\b(?:(SW|BW|W))(?:ELD)?(?:[-_:\s]*)?(?:No\.|#)?\s*([0-9OIl]{1,5}[A-Z]?)\b", re.IGNORECASE)
-
 FIELD_WELD_BLOCKERS = re.compile(r"\b(FW|F/W|FIELD\s*WELD|FIELDWELD)\b", flags=re.IGNORECASE)
 STRICT_W_FORM = re.compile(r"^(?:W|SW|BW)-\d{1,5}[A-Z]?$", flags=re.IGNORECASE)
 
 def _fix_ocr_digits(s: str) -> str:
-    # Only fix inside the numeric group
     return s.replace("O", "0").replace("o", "0").replace("I", "1").replace("l", "1")
 
 def _normalize_weld_id(prefix: str, raw_num: str) -> str:
     num = _fix_ocr_digits(raw_num).upper()
     m = re.match(r"(\d{1,5})([A-Z]?)$", num)
     if m:
-        core, suf = m.group(1), m.group(2)
-        n = int(core)
+        n = int(m.group(1))
+        suf = m.group(2)
         return f"{prefix.upper()}-{n}{suf}"
-    # fallback
     return f"{prefix.upper()}-{num}"
 
-def _scan_line_windows(lines: List[str], idx: int) -> List[str]:
+def _scan_line_windows(lines: List[str], idx: int, max_lines: int = 12) -> List[str]:
     """
-    Build compact windows joining up to 5 lines and stripping non-alphanumerics.
-    Returns list of 'window strings' to run regex against.
+    Build multiple windows joining up to N lines and compact them.
+    This catches S\nW\n0\n0\n1 and S W 0 0 1 etc.
     """
     windows = []
-    # window sizes: 1..5 lines
-    for k in range(1, 6):
+    for k in range(1, max_lines + 1):
         if idx + k <= len(lines):
             seg = " ".join(lines[idx: idx + k])
-            # compact: keep only A-Z0-9 and a few separators so base regex can still work
-            compact = re.sub(r"[^A-Za-z0-9:_#-]+", "", seg)
-            # also add a version with spaces normalized (for normal regex matches)
             spaced = re.sub(r"\s+", " ", seg)
+            compact = re.sub(r"[^A-Za-z0-9:_#-]+", "", seg)
             windows.append(spaced)
             windows.append(compact)
-    # Also add a char-compacted version of the single line to catch "S W 0 0 1"
-    single_compact = re.sub(r"[^A-Za-z0-9:_#-]+", "", lines[idx])
-    if single_compact not in windows:
-        windows.append(single_compact)
     return windows
 
-def find_weld_candidates(pages: List[Dict[str, Any]], aggressive: bool = True) -> List[Dict[str, Any]]:
+def _stitch_ladders(lines: List[str]) -> List[str]:
+    """
+    Join sequences of single-char lines to one token: S, W, 0, 0, 1 -> SW001
+    Also include a compacted form.
+    """
+    stitched = []
+    buffer = []
+    def flush():
+        if buffer:
+            token = "".join(buffer)
+            stitched.append(token)
+            stitched.append(re.sub(r"[^A-Za-z0-9:_#-]+", "", token))
+            buffer.clear()
+
+    for ln in lines:
+        t = ln.strip()
+        if len(t) == 1 and re.match(r"[A-Za-z0-9]", t):
+            buffer.append(t)
+        else:
+            flush()
+            stitched.append(ln)
+    flush()
+    return stitched
+
+def find_weld_candidates(
+    pages: List[Dict[str, Any]],
+    aggressive: bool = True,
+    return_preview: bool = False
+) -> Tuple[List[Dict[str, Any]], List[str]]:
     found: List[Dict[str, Any]] = []
+    preview: List[str] = []
     for p in pages:
-        text = p["text"] or ""
-        lines = text.split("\n")
+        raw_lines = (p["text"] or "").split("\n")
+
+        # extra pass: stitch ladders first
+        lines = _stitch_ladders(raw_lines)
 
         if aggressive:
-            # scan with sliding windows (joins lines / removes junk)
             for idx in range(len(lines)):
-                windows = _scan_line_windows(lines, idx)
-                for w in windows:
+                for w in _scan_line_windows(lines, idx, max_lines=12):
                     for m in BASE.finditer(w):
                         pref = (m.group(1) or "W").upper()
                         num = m.group(2)
-                        ctx_lines = lines[max(0, idx - 2): min(len(lines), idx + 7)]
-                        ctx = " | ".join(ctx_lines)
+                        ctx = " | ".join(lines[max(0, idx - 4): idx + 8])
                         found.append({
-                            "prefix": "W" if pref.startswith("W") and not pref.startswith("SW") and not pref.startswith("BW") else pref,
+                            "prefix": pref,
                             "number": num,
                             "page": p["page"],
                             "context": ctx
                         })
+                        preview.append(w[max(0, m.start()-5): m.end()+5])
         else:
-            # conservative: line-by-line only
             for idx, line in enumerate(lines):
                 for m in BASE.finditer(line):
                     pref = (m.group(1) or "W").upper()
                     num = m.group(2)
-                    ctx_lines = lines[max(0, idx - 2): min(len(lines), idx + 7)]
-                    ctx = " | ".join(ctx_lines)
+                    ctx = " | ".join(lines[max(0, idx - 4): idx + 8])
                     found.append({
-                        "prefix": "W" if pref.startswith("W") and not pref.startswith("SW") and not pref.startswith("BW") else pref,
+                        "prefix": pref,
                         "number": num,
                         "page": p["page"],
                         "context": ctx
                     })
-    return found
+                    preview.append(line[max(0, m.start()-5): m.end()+5])
 
-def filter_and_normalize_welds(
-    candidates: List[Dict[str, Any]],
-    exclude_field_welds: bool,
-    strict_form: bool
-):
+    if return_preview:
+        return found, preview
+    return found, []
+
+def filter_and_normalize_welds(candidates: List[Dict[str, Any]], exclude_field_welds: bool, strict_form: bool):
     rows = []
     for c in candidates:
         weld_id = _normalize_weld_id(c.get("prefix", "W"), c["number"])
@@ -161,13 +177,11 @@ def filter_and_normalize_welds(
     seen = set()
     unique = []
     for r in rows:
-        key = r["weld_id"]
-        if key in seen:
+        if r["weld_id"] in seen:
             continue
-        seen.add(key)
+        seen.add(r["weld_id"])
         unique.append(r)
 
-    # Sort by family (W < BW < SW), then number, then page
     def family_rank(wid: str) -> int:
         u = wid.upper()
         if u.startswith("W-"): return 0
@@ -182,7 +196,7 @@ def filter_and_normalize_welds(
     unique.sort(key=lambda x: (family_rank(x["weld_id"]), weld_num(x["weld_id"]), x["page"]))
     return unique
 
-# ---------- OPTIONAL LLM ENRICHMENT (temp=0) ----------
+# ---------- OPTIONAL LLM ENRICHMENT (kept from previous versions) ----------
 
 def _build_llm_messages(weld_id: str, ctx: str) -> list:
     system = (
