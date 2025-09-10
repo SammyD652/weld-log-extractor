@@ -52,13 +52,13 @@ with st.sidebar:
         index=0,
         help="Use gpt-4o for best accuracy."
     )
-    render_scale = st.slider("PDF render scale (clarity vs speed)", 1.5, 3.0, 2.8, 0.1)
+    render_scale = st.slider("PDF render scale (clarity vs speed)", 1.5, 3.0, 3.0, 0.1)
     st.caption("If small tags are missed, increase to 3.0 and re-run.")
 
 # -----------------------------
 # 3) PDF → PIL images
 # -----------------------------
-def pdf_bytes_to_images(pdf_bytes: bytes, scale: float = 2.8) -> List[Image.Image]:
+def pdf_bytes_to_images(pdf_bytes: bytes, scale: float = 3.0) -> List[Image.Image]:
     imgs: List[Image.Image] = []
     pdf = pdfium.PdfDocument(io.BytesIO(pdf_bytes))
     for i in range(len(pdf)):
@@ -73,7 +73,7 @@ def pil_to_b64(img: Image.Image, quality: int = 85) -> str:
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 # -----------------------------
-# 4) Vision prompt (STRICT: ignore legends/title blocks/tables)
+# 4) Vision prompts (STRICT)
 # -----------------------------
 SYSTEM_PROMPT = '''
 You are an expert welding QA/QC document reader.
@@ -91,9 +91,9 @@ TASK: Extract a weld list with ONLY these fields:
 - spec: the pipeline spec (e.g., CSJ, CSDN15). If a single global spec clearly applies to all welds on the sheet, you may apply it; otherwise use "".
 
 CRITICAL RULES:
-1) ONLY return weld numbers that are clearly visible as W-tags (e.g., W1, W01, W123) **placed next to a drawn joint on the isometric** (a junction of pipe/fitting). 
-2) IGNORE text from title blocks, borders, legends, revision notes, BOM/spec tables, general notes, and any schedules. Do NOT read W-tags out of tables or legends.
-3) DO NOT expand ranges (e.g., "W01–W50"). Only return the tags you can literally read as individual labels near joints.
+1) ONLY return weld numbers that are clearly visible as W-tags (e.g., W1, W01, W123) placed next to a drawn joint on the isometric.
+2) IGNORE text from title blocks, borders, legends, revision notes, BOM/spec tables, general notes, and schedules. Do NOT read W-tags out of tables or legends.
+3) DO NOT expand ranges (e.g., "W01–W50"). Only return tags you literally read as individual labels near joints.
 4) Never classify as Field unless "FW/F/W/Field" is clearly printed near that weld tag. If uncertain, default to "Shop".
 5) If any field is missing/illegible, use "" for that field, but still include the weld if weld_number is present.
 
@@ -103,65 +103,70 @@ Return JSON only in this schema:
 ]}
 
 Additional constraints:
-- A valid weld_number MUST look like W followed by 1–4 digits (e.g., W1, W01, W1234). 
+- A valid weld_number MUST look like W followed by 1–4 digits (e.g., W1, W01, W1234).
 - If you are not sure the text is a weld tag next to a joint, do not include it.
 '''
 
+GLOBAL_SIZE_PROMPT = '''
+You will be given one or more isometric page images. Decide if there is a SINGLE pipe size used across the sheet (e.g., ND 25, 25mm, DN25, 1").
+- Check BOM/ND tables, title block, and repeated size notes.
+- If there are multiple different sizes, return empty.
+- If exactly one size dominates the entire sheet, return it as text (e.g., "25", "DN25", "25mm", or "1\"").
+
+Return JSON ONLY:
+{"single_size": "<text or empty string>"}
+'''
+
 # -----------------------------
-# 5) Call GPT-4o (Chat Completions with image_url parts)
+# 5) OpenAI calls
 # -----------------------------
-def call_vision(images: List[Image.Image], model_name: str) -> Dict[str, Any]:
-    parts = [{"type": "text", "text": "Extract only the 4 fields and return JSON exactly as specified."}]
+def call_chat_completions(images: List[Image.Image], sys_prompt: str, user_intro_text: str) -> str:
+    parts = [{"type": "text", "text": user_intro_text}]
     for img in images:
         parts.append({
             "type": "image_url",
             "image_url": {"url": f"data:image/jpeg;base64,{pil_to_b64(img)}"}
         })
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": parts},
+        ],
+        temperature=0,
+    )
+    return resp.choices[0].message.content or ""
 
-    # Primary path: chat.completions
-    try:
-        resp = client.chat.completions.create(
-            model=model_name,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": parts},
-            ],
-            temperature=0,
-        )
-        text = resp.choices[0].message.content or ""
-    except Exception:
-        # Fallback: responses API
-        try:
-            alt_parts = [{"type": "input_text", "text": "Extract JSON only."}]
-            for img in images:
-                alt_parts.append({"type": "input_image", "image_url": f"data:image/jpeg;base64,{pil_to_b64(img)}"})
-            resp2 = client.responses.create(
-                model=model_name,
-                input=[{"role": "system", "content": SYSTEM_PROMPT},
-                       {"role": "user", "content": alt_parts}],
-                temperature=0,
-                response_format={"type": "json_object"},
-            )
-            text = resp2.output_text
-        except Exception:
-            text = ""
-
-    # Parse JSON
+def call_vision_extract(images: List[Image.Image]) -> Dict[str, Any]:
+    text = call_chat_completions(images, SYSTEM_PROMPT, "Extract only the 4 fields and return JSON exactly as specified.")
+    # Parse JSON or JSON inside text
     for attempt in range(2):
         try:
-            if attempt == 0:
-                data = json.loads(text)
-            else:
-                start, end = text.find("{"), text.rfind("}")
-                if start != -1 and end != -1 and end > start:
-                    data = json.loads(text[start:end+1])
-                else:
-                    data = {"welds": []}
+            data = json.loads(text) if attempt == 0 else json.loads(text[text.find("{"):text.rfind("}")+1])
             if isinstance(data, dict) and isinstance(data.get("welds", []), list):
                 return data
         except Exception:
             pass
     return {"welds": []}
+
+def detect_global_size(images: List[Image.Image]) -> str:
+    """Ask the model if there's exactly one pipe size on this sheet."""
+    text = call_chat_completions(images, GLOBAL_SIZE_PROMPT, "Determine if there is one single pipe size across the sheet. Return JSON.")
+    try:
+        data = json.loads(text)
+        size = str(data.get("single_size", "")).strip()
+        # quick cleanup: remove trailing punctuation
+        size = size.rstrip(".,; ")
+        return size
+    except Exception:
+        try:
+            start, end = text.find("{"), text.rfind("}")
+            if start != -1 and end != -1:
+                data = json.loads(text[start:end+1])
+                return str(data.get("single_size", "")).strip().rstrip(".,; ")
+        except Exception:
+            pass
+    return ""
 
 # -----------------------------
 # 6) Normalisation + validation + table
@@ -189,7 +194,7 @@ def to_table(data: Dict[str, Any]) -> pd.DataFrame:
     for w in data.get("welds", []):
         wn = str(w.get("weld_number", "")).strip()
         if not is_valid_weld_number(wn):
-            continue  # keep only W + digits
+            continue
         rows.append({
             "Weld Number": wn.upper(),
             "Shop / Field": normalise_shop_field(w.get("shop_or_field", "")),
@@ -284,8 +289,16 @@ if run:
     st.success(f"Rendered {len(all_imgs)} page image(s).")
 
     with st.spinner("Extracting welds with GPT-4o…"):
-        result = call_vision(all_imgs, model)
+        result = call_vision_extract(all_imgs)
     df_pred = to_table(result)
+
+    # -------- Global size fallback (fill blanks if the sheet uses a single size) --------
+    if not df_pred.empty:
+        blanks = df_pred["Weld Size"].astype(str).str.strip().eq("").sum()
+        if blanks > 0:
+            single_size = detect_global_size(all_imgs)
+            if single_size:
+                df_pred["Weld Size"] = df_pred["Weld Size"].apply(lambda x: single_size if str(x).strip() == "" else x)
 
     st.subheader("Results")
     if df_pred.empty:
@@ -293,6 +306,7 @@ if run:
     else:
         st.dataframe(df_pred, use_container_width=True)
 
+        # Download
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
             df_pred.to_excel(w, index=False, sheet_name="Weld Log (4 fields)")
