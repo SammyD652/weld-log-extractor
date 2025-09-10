@@ -97,4 +97,38 @@ def main():
         "Joint Type": ["" for _ in welds],
         "Material Description": ["" for _ in welds],
         "Source Page": [w["page"] for w in welds],
-        "Context
+        "Context": [w["context"] for w in welds],
+    })
+
+    # Optional LLM enrichment
+    if llm_enrichment:
+        if not get_api_key():
+            st.warning("LLM enrichment requires an OpenAI API key in the sidebar.")
+        else:
+            with st.spinner("LLM enrichment (deterministic, temp=0)…"):
+                df = enrich_with_llm_fields(df, api_key=get_api_key())
+
+    st.subheader("Weld Log (deterministic)")
+    st.write(f"Total welds: **{len(df)}**")
+
+    # ✅ Fix: use_container_width instead of width='stretch'
+    st.dataframe(df.drop(columns=["Context"], errors="ignore"), use_container_width=True)
+
+    # Safe Excel export (works even if df is empty)
+    excel_df = df.drop(columns=["Context"], errors="ignore")
+    excel_bytes = df_to_excel_bytes(excel_df)
+    st.download_button(
+        "Download Excel",
+        data=excel_bytes,
+        file_name=f"weld_log_{int(time.time())}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
+    if len(df) == 0:
+        st.info(
+            "No weld IDs detected. This drawing may use labels like **SW 001** split across lines. "
+            "Keep **Strict pattern OFF** first, and if Raw text is sparse, toggle **Force OCR fallback** ON."
+        )
+
+if __name__ == "__main__":
+    main()
