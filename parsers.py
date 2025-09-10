@@ -1,12 +1,7 @@
-import io
-import re
-import json
+import io, re, json
 from typing import List, Dict, Any, Tuple
+import pdfplumber, pandas as pd
 
-import pdfplumber
-import pandas as pd
-
-# OCR deps (optional)
 try:
     import pypdfium2 as pdfium
     import pytesseract
@@ -15,7 +10,7 @@ try:
 except Exception:
     OCR_AVAILABLE = False
 
-# ---------- PDF TEXT EXTRACTION (vector + OCR fallback) ----------
+# ---------------- PDF Extraction ----------------
 
 def _page_text_pdfplumber(pdf_bytes: bytes) -> List[Dict[str, Any]]:
     pages = []
@@ -31,17 +26,10 @@ def _ocr_page(pdf_bytes: bytes, page_index: int, dpi: int = 300) -> str:
         return ""
     doc = pdfium.PdfDocument(io.BytesIO(pdf_bytes))
     page = doc[page_index]
-    scale = dpi / 72.0
-    bitmap = page.render(scale=scale).to_pil()
-    img = bitmap.convert("L")
-    img = ImageOps.autocontrast(img)
-    img = img.filter(ImageFilter.SHARPEN)
-    # diagrams: single uniform block tends to work best
-    # - PSM 6 (assume block) usually reduces per-char lines
+    img = page.render(scale=dpi/72).to_pil().convert("L")
+    img = ImageOps.autocontrast(img).filter(ImageFilter.SHARPEN)
     config = "-l eng --oem 3 --psm 6 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_:#"
-    text = pytesseract.image_to_string(img, config=config)
-    text = "\n".join(line.strip() for line in text.splitlines())
-    return text
+    return pytesseract.image_to_string(img, config=config)
 
 def extract_pdf_text_per_page(pdf_bytes: bytes, enable_ocr_fallback: bool = False) -> List[Dict[str, Any]]:
     pages = _page_text_pdfplumber(pdf_bytes)
@@ -49,240 +37,77 @@ def extract_pdf_text_per_page(pdf_bytes: bytes, enable_ocr_fallback: bool = Fals
     for p in pages:
         text = p["text"]
         if enable_ocr_fallback or len(text.strip()) < 30:
-            ocr_text = _ocr_page(pdf_bytes, p["page"] - 1)
+            ocr_text = _ocr_page(pdf_bytes, p["page"]-1)
             if len(ocr_text.strip()) > len(text.strip()):
                 text = ocr_text
         out.append({"page": p["page"], "text": text})
     return out
 
-# ---------- WELD ID DETECTION ----------
+# ---------------- Weld ID Detection ----------------
 
-# Base regex on compacted strings.
-BASE = re.compile(r"\b(?:(SW|BW|W))(?:ELD)?(?:[-_:\s]*)?(?:No\.|#)?\s*([0-9OIl]{1,5}[A-Z]?)\b", re.IGNORECASE)
-FIELD_WELD_BLOCKERS = re.compile(r"\b(FW|F/W|FIELD\s*WELD|FIELDWELD)\b", flags=re.IGNORECASE)
-STRICT_W_FORM = re.compile(r"^(?:W|SW|BW)-\d{1,5}[A-Z]?$", flags=re.IGNORECASE)
+BASE = re.compile(r"\b(?:(SW|BW|W))(?:ELD)?[-_:\s]*(?:No\.|#)?\s*([0-9OIl]{1,5}[A-Z]?)\b", re.I)
+STRICT_W_FORM = re.compile(r"^(?:W|SW|BW)-\d{1,5}[A-Z]?$", re.I)
+FIELD_WELD_BLOCKERS = re.compile(r"\b(FW|F/W|FIELD\s*WELD)\b", re.I)
 
-def _fix_ocr_digits(s: str) -> str:
-    return s.replace("O", "0").replace("o", "0").replace("I", "1").replace("l", "1")
+def _fix_digits(s: str) -> str:
+    return s.replace("O","0").replace("o","0").replace("I","1").replace("l","1")
 
-def _normalize_weld_id(prefix: str, raw_num: str) -> str:
-    num = _fix_ocr_digits(raw_num).upper()
-    m = re.match(r"(\d{1,5})([A-Z]?)$", num)
-    if m:
-        n = int(m.group(1))
-        suf = m.group(2)
-        return f"{prefix.upper()}-{n}{suf}"
-    return f"{prefix.upper()}-{num}"
+def _normalize(prefix: str, raw: str) -> str:
+    raw = _fix_digits(raw).upper()
+    m = re.match(r"(\d{1,5})([A-Z]?)$", raw)
+    if m: return f"{prefix}-{int(m.group(1))}{m.group(2)}"
+    return f"{prefix}-{raw}"
 
-def _scan_line_windows(lines: List[str], idx: int, max_lines: int = 12) -> List[str]:
-    """
-    Build multiple windows joining up to N lines and compact them.
-    This catches S\nW\n0\n0\n1 and S W 0 0 1 etc.
-    """
-    windows = []
-    for k in range(1, max_lines + 1):
-        if idx + k <= len(lines):
-            seg = " ".join(lines[idx: idx + k])
-            spaced = re.sub(r"\s+", " ", seg)
-            compact = re.sub(r"[^A-Za-z0-9:_#-]+", "", seg)
-            windows.append(spaced)
-            windows.append(compact)
-    return windows
-
-def _stitch_ladders(lines: List[str]) -> List[str]:
-    """
-    Join sequences of single-char lines to one token: S, W, 0, 0, 1 -> SW001
-    Also include a compacted form.
-    """
-    stitched = []
-    buffer = []
+def _stitch(lines: List[str]) -> List[str]:
+    stitched, buf = [], []
     def flush():
-        if buffer:
-            token = "".join(buffer)
-            stitched.append(token)
-            stitched.append(re.sub(r"[^A-Za-z0-9:_#-]+", "", token))
-            buffer.clear()
-
+        if buf: stitched.append("".join(buf)); buf.clear()
     for ln in lines:
-        t = ln.strip()
-        if len(t) == 1 and re.match(r"[A-Za-z0-9]", t):
-            buffer.append(t)
-        else:
-            flush()
-            stitched.append(ln)
+        if len(ln.strip())==1 and ln.strip().isalnum(): buf.append(ln.strip())
+        else: flush(); stitched.append(ln)
     flush()
     return stitched
 
-def find_weld_candidates(
-    pages: List[Dict[str, Any]],
-    aggressive: bool = True,
-    return_preview: bool = False
-) -> Tuple[List[Dict[str, Any]], List[str]]:
-    found: List[Dict[str, Any]] = []
-    preview: List[str] = []
+def _scan_windows(lines: List[str], idx: int, max_lines=10) -> List[str]:
+    out=[]
+    for k in range(1,max_lines+1):
+        if idx+k<=len(lines):
+            seg=" ".join(lines[idx:idx+k])
+            out.append(re.sub(r"\s+"," ",seg))
+            out.append(re.sub(r"[^A-Za-z0-9:_#-]+","",seg))
+    return out
+
+def find_weld_candidates(pages: List[Dict[str, Any]], aggressive=True, return_preview=False) -> Tuple[List[Dict[str, Any]], List[str]]:
+    found, preview=[],[]
     for p in pages:
-        raw_lines = (p["text"] or "").split("\n")
+        lines=_stitch((p["text"] or "").split("\n"))
+        for idx in range(len(lines)):
+            scan=_scan_windows(lines, idx, 12 if aggressive else 1)
+            for w in scan:
+                for m in BASE.finditer(w):
+                    pref,num=(m.group(1) or "W").upper(), m.group(2)
+                    ctx=" | ".join(lines[max(0,idx-3):idx+6])
+                    found.append({"prefix":pref,"number":num,"page":p["page"],"context":ctx})
+                    preview.append(w)
+    return (found,preview) if return_preview else (found,[])
 
-        # extra pass: stitch ladders first
-        lines = _stitch_ladders(raw_lines)
-
-        if aggressive:
-            for idx in range(len(lines)):
-                for w in _scan_line_windows(lines, idx, max_lines=12):
-                    for m in BASE.finditer(w):
-                        pref = (m.group(1) or "W").upper()
-                        num = m.group(2)
-                        ctx = " | ".join(lines[max(0, idx - 4): idx + 8])
-                        found.append({
-                            "prefix": pref,
-                            "number": num,
-                            "page": p["page"],
-                            "context": ctx
-                        })
-                        preview.append(w[max(0, m.start()-5): m.end()+5])
-        else:
-            for idx, line in enumerate(lines):
-                for m in BASE.finditer(line):
-                    pref = (m.group(1) or "W").upper()
-                    num = m.group(2)
-                    ctx = " | ".join(lines[max(0, idx - 4): idx + 8])
-                    found.append({
-                        "prefix": pref,
-                        "number": num,
-                        "page": p["page"],
-                        "context": ctx
-                    })
-                    preview.append(line[max(0, m.start()-5): m.end()+5])
-
-    if return_preview:
-        return found, preview
-    return found, []
-
-def filter_and_normalize_welds(candidates: List[Dict[str, Any]], exclude_field_welds: bool, strict_form: bool):
-    rows = []
-    for c in candidates:
-        weld_id = _normalize_weld_id(c.get("prefix", "W"), c["number"])
-        ctx = c.get("context", "") or ""
-        if exclude_field_welds and FIELD_WELD_BLOCKERS.search(ctx):
-            continue
-        if strict_form and not STRICT_W_FORM.match(weld_id):
-            continue
-        rows.append({
-            "weld_id": weld_id,
-            "page": c["page"],
-            "context": ctx,
-        })
-
-    # De-duplicate deterministically
-    seen = set()
-    unique = []
+def filter_and_normalize_welds(cands: List[Dict[str,Any]], exclude_fw: bool, strict: bool):
+    rows=[]
+    for c in cands:
+        wid=_normalize(c["prefix"], c["number"])
+        if exclude_fw and FIELD_WELD_BLOCKERS.search(c["context"]): continue
+        if strict and not STRICT_W_FORM.match(wid): continue
+        rows.append({"weld_id":wid,"page":c["page"],"context":c["context"]})
+    seen=set(); out=[]
     for r in rows:
-        if r["weld_id"] in seen:
-            continue
-        seen.add(r["weld_id"])
-        unique.append(r)
+        if r["weld_id"] not in seen:
+            seen.add(r["weld_id"]); out.append(r)
+    return out
 
-    def family_rank(wid: str) -> int:
-        u = wid.upper()
-        if u.startswith("W-"): return 0
-        if u.startswith("BW-"): return 1
-        if u.startswith("SW-"): return 2
-        return 9
-
-    def weld_num(wid: str) -> int:
-        m = re.search(r"-([0-9]+)", wid)
-        return int(m.group(1)) if m else 10**9
-
-    unique.sort(key=lambda x: (family_rank(x["weld_id"]), weld_num(x["weld_id"]), x["page"]))
-    return unique
-
-# ---------- OPTIONAL LLM ENRICHMENT (kept from previous versions) ----------
-
-def _build_llm_messages(weld_id: str, ctx: str) -> list:
-    system = (
-        "You extract weld attributes only from the provided text context. "
-        "If unknown, return empty strings. Do NOT guess or invent values. "
-        "Return JSON strictly matching the schema."
-    )
-    user = (
-        f"Context snippet from an isometric drawing's text:\n\n{ctx}\n\n"
-        f"Target weld: {weld_id}\n\n"
-        "If size (ND), joint type, or material description are explicitly present near this weld, extract them. "
-        "Otherwise, leave them blank."
-    )
-    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
-
-def _openai_client(api_key: str):
-    try:
-        from openai import OpenAI
-        return OpenAI(api_key=api_key)
-    except Exception:
-        return None
-
-def enrich_with_llm_fields(df: pd.DataFrame, api_key: str) -> pd.DataFrame:
-    client = _openai_client(api_key)
-    if client is None or df.empty:
-        return df
-
-    schema = {
-        "name": "weld_fields",
-        "schema": {
-            "type": "object",
-            "properties": {
-                "weld_number": {"type": "string"},
-                "joint_size_nd": {"type": "string"},
-                "joint_type": {"type": "string"},
-                "material_description": {"type": "string"},
-            },
-            "required": ["weld_number", "joint_size_nd", "joint_type", "material_description"],
-            "additionalProperties": False,
-        },
-        "strict": True,
-    }
-
-    out_rows = []
-    for _, row in df.iterrows():
-        messages = _build_llm_messages(str(row["Weld Number"]), str(row.get("Context", "")))
-        try:
-            resp = client.chat.completions.create(
-                model="gpt-4o-mini",
-                temperature=0.0,
-                response_format={"type": "json_schema", "json_schema": schema},
-                messages=messages,
-            )
-            content = resp.choices[0].message.content
-            data = json.loads(content)
-            out_rows.append({
-                "Weld Number": row["Weld Number"],
-                "Joint Size (ND)": data.get("joint_size_nd", ""),
-                "Joint Type": data.get("joint_type", ""),
-                "Material Description": data.get("material_description", ""),
-                "Source Page": row["Source Page"],
-                "Context": row.get("Context", ""),
-            })
-        except Exception:
-            out_rows.append({
-                "Weld Number": row["Weld Number"],
-                "Joint Size (ND)": "",
-                "Joint Type": "",
-                "Material Description": "",
-                "Source Page": row["Source Page"],
-                "Context": row.get("Context", ""),
-            })
-    return pd.DataFrame(out_rows)
-
-# ---------- EXPORT (safe even if empty) ----------
+# ---------------- Export ----------------
 
 def df_to_excel_bytes(df: pd.DataFrame) -> bytes:
-    buf = io.BytesIO()
+    buf=io.BytesIO()
     with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
-        (df if df is not None else pd.DataFrame()).to_excel(writer, index=False, sheet_name="Weld Log")
-        worksheet = writer.sheets["Weld Log"]
-        for i, col in enumerate((df.columns if df is not None else [])):
-            header_len = len(str(col))
-            series = df[col].astype(str) if df is not None else pd.Series(dtype=str)
-            mean_len = float(series.str.len().mean(skipna=True) or 0) if len(series) else 0
-            width = min(50, max(12, int(round(max(header_len, mean_len) + 6))))
-            worksheet.set_column(i, i, width)
-    buf.seek(0)
-    return buf.getvalue()
+        df.to_excel(writer,index=False,sheet_name="Weld Log")
+    buf.seek(0); return buf.getvalue()
