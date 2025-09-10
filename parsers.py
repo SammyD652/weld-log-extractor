@@ -36,7 +36,8 @@ def _ocr_page(pdf_bytes: bytes, page_index: int, dpi: int = 300) -> str:
     img = bitmap.convert("L")
     img = ImageOps.autocontrast(img)
     img = img.filter(ImageFilter.SHARPEN)
-    config = "-l eng --oem 3 --psm 6"
+    # Sparse diagrams benefit from PSM 11; we also whitelist useful chars
+    config = "-l eng --oem 3 --psm 11 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_:#"
     text = pytesseract.image_to_string(img, config=config)
     text = "\n".join(line.strip() for line in text.splitlines())
     return text
@@ -55,71 +56,86 @@ def extract_pdf_text_per_page(pdf_bytes: bytes, enable_ocr_fallback: bool = Fals
 
 # ---------- WELD ID DETECTION ----------
 
-# Accept variants:
-#  - W-12 / W 12 / W:12 / W_12 / WELD-12
-#  - SW 001 / SW-1  (socket weld numbering seen on your PDF)
-#  - BW 015 / BW-15 (butt weld numbering if used)
-# We capture type and number so we can normalize like SW-1 / W-12
-WELD_PATTERN = re.compile(
-    r"\b(?:(W(?:ELD)?)|(SW)|(BW))\s*[-_:]?\s*(?:No\.|#)?\s*(\d{1,5}[A-Z]?)\b",
-    flags=re.IGNORECASE,
-)
+# Base regex (works on compact strings too)
+# prefix: W / SW / BW (WELD → W)
+# number: 1-5 digits possibly with a trailing letter (A-Z)
+BASE = re.compile(r"\b(?:(SW|BW|W))(?:ELD)?(?:[-_:\s]*)?(?:No\.|#)?\s*([0-9OIl]{1,5}[A-Z]?)\b", re.IGNORECASE)
 
 FIELD_WELD_BLOCKERS = re.compile(r"\b(FW|F/W|FIELD\s*WELD|FIELDWELD)\b", flags=re.IGNORECASE)
 STRICT_W_FORM = re.compile(r"^(?:W|SW|BW)-\d{1,5}[A-Z]?$", flags=re.IGNORECASE)
 
+def _fix_ocr_digits(s: str) -> str:
+    # Only fix inside the numeric group
+    return s.replace("O", "0").replace("o", "0").replace("I", "1").replace("l", "1")
+
 def _normalize_weld_id(prefix: str, raw_num: str) -> str:
-    num = raw_num.upper()
+    num = _fix_ocr_digits(raw_num).upper()
     m = re.match(r"(\d{1,5})([A-Z]?)$", num)
-    core, suf = (m.group(1), m.group(2)) if m else (num, "")
-    # Normalize 001 -> 1
-    try:
+    if m:
+        core, suf = m.group(1), m.group(2)
         n = int(core)
-    except Exception:
-        n = core
-    pref = prefix.upper()
-    if pref.startswith("W"):
-        pref = "W"
-    return f"{pref}-{n}{suf}"
+        return f"{prefix.upper()}-{n}{suf}"
+    # fallback
+    return f"{prefix.upper()}-{num}"
 
-def _scan_text_for_matches(text: str, page_no: int, lines: List[str], idx: int) -> List[Dict[str, Any]]:
+def _scan_line_windows(lines: List[str], idx: int) -> List[str]:
     """
-    Runs regex on:
-      - current line
-      - bigram: line[i] + ' ' + line[i+1]
-      - trigram: line[i] + ' ' + line[i+1] + ' ' + line[i+2]
-    This catches SHX-split labels like 'SW' on one line and '001' on the next.
+    Build compact windows joining up to 5 lines and stripping non-alphanumerics.
+    Returns list of 'window strings' to run regex against.
     """
-    out = []
     windows = []
-    l0 = lines[idx]
-    windows.append(l0)
-    if idx + 1 < len(lines):
-        windows.append(l0 + " " + lines[idx + 1])
-    if idx + 2 < len(lines):
-        windows.append(l0 + " " + lines[idx + 1] + " " + lines[idx + 2])
+    # window sizes: 1..5 lines
+    for k in range(1, 6):
+        if idx + k <= len(lines):
+            seg = " ".join(lines[idx: idx + k])
+            # compact: keep only A-Z0-9 and a few separators so base regex can still work
+            compact = re.sub(r"[^A-Za-z0-9:_#-]+", "", seg)
+            # also add a version with spaces normalized (for normal regex matches)
+            spaced = re.sub(r"\s+", " ", seg)
+            windows.append(spaced)
+            windows.append(compact)
+    # Also add a char-compacted version of the single line to catch "S W 0 0 1"
+    single_compact = re.sub(r"[^A-Za-z0-9:_#-]+", "", lines[idx])
+    if single_compact not in windows:
+        windows.append(single_compact)
+    return windows
 
-    for w in windows:
-        for m in WELD_PATTERN.finditer(w):
-            pref = m.group(1) or m.group(2) or m.group(3) or "W"
-            num = m.group(4)
-            ctx_lines = lines[max(0, idx - 2): idx + 5]
-            ctx = " | ".join(ctx_lines)
-            out.append({
-                "prefix": pref,
-                "number": num,
-                "page": page_no,
-                "context": ctx
-            })
-    return out
-
-def find_weld_candidates(pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def find_weld_candidates(pages: List[Dict[str, Any]], aggressive: bool = True) -> List[Dict[str, Any]]:
     found: List[Dict[str, Any]] = []
     for p in pages:
         text = p["text"] or ""
         lines = text.split("\n")
-        for idx, _ in enumerate(lines):
-            found.extend(_scan_text_for_matches(text, p["page"], lines, idx))
+
+        if aggressive:
+            # scan with sliding windows (joins lines / removes junk)
+            for idx in range(len(lines)):
+                windows = _scan_line_windows(lines, idx)
+                for w in windows:
+                    for m in BASE.finditer(w):
+                        pref = (m.group(1) or "W").upper()
+                        num = m.group(2)
+                        ctx_lines = lines[max(0, idx - 2): min(len(lines), idx + 7)]
+                        ctx = " | ".join(ctx_lines)
+                        found.append({
+                            "prefix": "W" if pref.startswith("W") and not pref.startswith("SW") and not pref.startswith("BW") else pref,
+                            "number": num,
+                            "page": p["page"],
+                            "context": ctx
+                        })
+        else:
+            # conservative: line-by-line only
+            for idx, line in enumerate(lines):
+                for m in BASE.finditer(line):
+                    pref = (m.group(1) or "W").upper()
+                    num = m.group(2)
+                    ctx_lines = lines[max(0, idx - 2): min(len(lines), idx + 7)]
+                    ctx = " | ".join(ctx_lines)
+                    found.append({
+                        "prefix": "W" if pref.startswith("W") and not pref.startswith("SW") and not pref.startswith("BW") else pref,
+                        "number": num,
+                        "page": p["page"],
+                        "context": ctx
+                    })
     return found
 
 def filter_and_normalize_welds(
@@ -130,7 +146,7 @@ def filter_and_normalize_welds(
     rows = []
     for c in candidates:
         weld_id = _normalize_weld_id(c.get("prefix", "W"), c["number"])
-        ctx = c["context"] or ""
+        ctx = c.get("context", "") or ""
         if exclude_field_welds and FIELD_WELD_BLOCKERS.search(ctx):
             continue
         if strict_form and not STRICT_W_FORM.match(weld_id):
@@ -153,9 +169,10 @@ def filter_and_normalize_welds(
 
     # Sort by family (W < BW < SW), then number, then page
     def family_rank(wid: str) -> int:
-        if wid.upper().startswith("W-"): return 0
-        if wid.upper().startswith("BW-"): return 1
-        if wid.upper().startswith("SW-"): return 2
+        u = wid.upper()
+        if u.startswith("W-"): return 0
+        if u.startswith("BW-"): return 1
+        if u.startswith("SW-"): return 2
         return 9
 
     def weld_num(wid: str) -> int:
