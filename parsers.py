@@ -1,12 +1,12 @@
 import io
 import re
 import json
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 
 import pdfplumber
 import pandas as pd
 
-# OCR deps
+# OCR deps (optional)
 try:
     import pypdfium2 as pdfium
     import pytesseract
@@ -15,7 +15,7 @@ try:
 except Exception:
     OCR_AVAILABLE = False
 
-# ---------- PDF TEXT EXTRACTION (deterministic with optional OCR fallback) ----------
+# ---------- PDF TEXT EXTRACTION (vector text + optional OCR fallback) ----------
 
 def _page_text_pdfplumber(pdf_bytes: bytes) -> List[Dict[str, Any]]:
     pages = []
@@ -27,41 +27,27 @@ def _page_text_pdfplumber(pdf_bytes: bytes) -> List[Dict[str, Any]]:
     return pages
 
 def _ocr_page(pdf_bytes: bytes, page_index: int, dpi: int = 300) -> str:
-    """
-    Render a page to bitmap with pypdfium2, then OCR with Tesseract.
-    Deterministic given same input & params.
-    """
     if not OCR_AVAILABLE:
         return ""
     doc = pdfium.PdfDocument(io.BytesIO(pdf_bytes))
     page = doc[page_index]
-    # scale factor: pixels = points * scale ; points are 72 dpi
     scale = dpi / 72.0
-    bitmap = page.render(scale=scale).to_pil()  # PIL.Image
-    # Light preprocessing for OCR
+    bitmap = page.render(scale=scale).to_pil()
     img = bitmap.convert("L")
     img = ImageOps.autocontrast(img)
     img = img.filter(ImageFilter.SHARPEN)
-    # Tesseract config: English, LSTM (oem 3), assume blocks of text (psm 6)
     config = "-l eng --oem 3 --psm 6"
     text = pytesseract.image_to_string(img, config=config)
-    # Normalize whitespace
     text = "\n".join(line.strip() for line in text.splitlines())
     return text
 
 def extract_pdf_text_per_page(pdf_bytes: bytes, enable_ocr_fallback: bool = False) -> List[Dict[str, Any]]:
-    """
-    First try vector text (pdfplumber). If page has too little text or
-    OCR is forced, do OCR on that page.
-    """
     pages = _page_text_pdfplumber(pdf_bytes)
-    # If forced, OCR all pages; else OCR only pages with almost no text
     out = []
     for p in pages:
         text = p["text"]
         if enable_ocr_fallback or len(text.strip()) < 30:
             ocr_text = _ocr_page(pdf_bytes, p["page"] - 1)
-            # Prefer OCR if it yields more text
             if len(ocr_text.strip()) > len(text.strip()):
                 text = ocr_text
         out.append({"page": p["page"], "text": text})
@@ -69,65 +55,81 @@ def extract_pdf_text_per_page(pdf_bytes: bytes, enable_ocr_fallback: bool = Fals
 
 # ---------- WELD ID DETECTION ----------
 
-# Accept common variants:
-#  - W-12, W-123, W 12, W:12, W_12, WELD-12, WELD 12
-#  - optional single trailing letter (e.g. W-12A) which some shops use
+# Accept variants:
+#  - W-12 / W 12 / W:12 / W_12 / WELD-12
+#  - SW 001 / SW-1  (socket weld numbering seen on your PDF)
+#  - BW 015 / BW-15 (butt weld numbering if used)
+# We capture type and number so we can normalize like SW-1 / W-12
 WELD_PATTERN = re.compile(
-    r"\b(?:W(?:ELD)?)\s*[-_:]?\s*(?:No\.|#)?\s*(\d{1,5}[A-Z]?)\b",
+    r"\b(?:(W(?:ELD)?)|(SW)|(BW))\s*[-_:]?\s*(?:No\.|#)?\s*(\d{1,5}[A-Z]?)\b",
     flags=re.IGNORECASE,
 )
 
-# Blockers for field welds
 FIELD_WELD_BLOCKERS = re.compile(r"\b(FW|F/W|FIELD\s*WELD|FIELDWELD)\b", flags=re.IGNORECASE)
+STRICT_W_FORM = re.compile(r"^(?:W|SW|BW)-\d{1,5}[A-Z]?$", flags=re.IGNORECASE)
 
-STRICT_W_FORM = re.compile(r"^W-\d{1,5}[A-Z]?$")
+def _normalize_weld_id(prefix: str, raw_num: str) -> str:
+    num = raw_num.upper()
+    m = re.match(r"(\d{1,5})([A-Z]?)$", num)
+    core, suf = (m.group(1), m.group(2)) if m else (num, "")
+    # Normalize 001 -> 1
+    try:
+        n = int(core)
+    except Exception:
+        n = core
+    pref = prefix.upper()
+    if pref.startswith("W"):
+        pref = "W"
+    return f"{pref}-{n}{suf}"
+
+def _scan_text_for_matches(text: str, page_no: int, lines: List[str], idx: int) -> List[Dict[str, Any]]:
+    """
+    Runs regex on:
+      - current line
+      - bigram: line[i] + ' ' + line[i+1]
+      - trigram: line[i] + ' ' + line[i+1] + ' ' + line[i+2]
+    This catches SHX-split labels like 'SW' on one line and '001' on the next.
+    """
+    out = []
+    windows = []
+    l0 = lines[idx]
+    windows.append(l0)
+    if idx + 1 < len(lines):
+        windows.append(l0 + " " + lines[idx + 1])
+    if idx + 2 < len(lines):
+        windows.append(l0 + " " + lines[idx + 1] + " " + lines[idx + 2])
+
+    for w in windows:
+        for m in WELD_PATTERN.finditer(w):
+            pref = m.group(1) or m.group(2) or m.group(3) or "W"
+            num = m.group(4)
+            ctx_lines = lines[max(0, idx - 2): idx + 5]
+            ctx = " | ".join(ctx_lines)
+            out.append({
+                "prefix": pref,
+                "number": num,
+                "page": page_no,
+                "context": ctx
+            })
+    return out
 
 def find_weld_candidates(pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Find raw candidates with small context windows.
-    Returns list of dicts: {weld_id_raw, number, page, context}
-    """
     found: List[Dict[str, Any]] = []
     for p in pages:
         text = p["text"] or ""
         lines = text.split("\n")
-        for idx, line in enumerate(lines):
-            for m in WELD_PATTERN.finditer(line):
-                num = m.group(1)
-                raw = m.group(0)
-                ctx_lines = lines[max(0, idx - 2): idx + 3]
-                ctx = " | ".join(ctx_lines)
-                found.append({
-                    "weld_id_raw": raw,
-                    "number": num,
-                    "page": p["page"],
-                    "context": ctx
-                })
+        for idx, _ in enumerate(lines):
+            found.extend(_scan_text_for_matches(text, p["page"], lines, idx))
     return found
-
-def _normalize_weld_id(raw_num: str) -> str:
-    num = raw_num.upper()
-    # separate trailing letter if exists
-    m = re.match(r"(\d{1,5})([A-Z]?)$", num)
-    if not m:
-        return f"W-{num}"
-    core, suffix = m.group(1), m.group(2)
-    return f"W-{int(core)}{suffix}"
 
 def filter_and_normalize_welds(
     candidates: List[Dict[str, Any]],
     exclude_field_welds: bool,
     strict_form: bool
 ):
-    """
-    - Normalize to W-<n>[A]
-    - Exclude FW/Field Weld if requested (by context window)
-    - De-duplicate deterministically (first occurrence)
-    - Sort deterministically by numeric then suffix then page
-    """
     rows = []
     for c in candidates:
-        weld_id = _normalize_weld_id(c["number"])
+        weld_id = _normalize_weld_id(c.get("prefix", "W"), c["number"])
         ctx = c["context"] or ""
         if exclude_field_welds and FIELD_WELD_BLOCKERS.search(ctx):
             continue
@@ -139,6 +141,7 @@ def filter_and_normalize_welds(
             "context": ctx,
         })
 
+    # De-duplicate deterministically
     seen = set()
     unique = []
     for r in rows:
@@ -148,15 +151,18 @@ def filter_and_normalize_welds(
         seen.add(key)
         unique.append(r)
 
+    # Sort by family (W < BW < SW), then number, then page
+    def family_rank(wid: str) -> int:
+        if wid.upper().startswith("W-"): return 0
+        if wid.upper().startswith("BW-"): return 1
+        if wid.upper().startswith("SW-"): return 2
+        return 9
+
     def weld_num(wid: str) -> int:
-        m = re.match(r"W-(\d+)", wid)
+        m = re.search(r"-([0-9]+)", wid)
         return int(m.group(1)) if m else 10**9
 
-    def weld_suffix(wid: str) -> str:
-        m = re.match(r"W-\d+([A-Z]?)$", wid)
-        return m.group(1) if m else ""
-
-    unique.sort(key=lambda x: (weld_num(x["weld_id"]), weld_suffix(x["weld_id"]), x["page"]))
+    unique.sort(key=lambda x: (family_rank(x["weld_id"]), weld_num(x["weld_id"]), x["page"]))
     return unique
 
 # ---------- OPTIONAL LLM ENRICHMENT (temp=0) ----------
@@ -232,31 +238,19 @@ def enrich_with_llm_fields(df: pd.DataFrame, api_key: str) -> pd.DataFrame:
                 "Source Page": row["Source Page"],
                 "Context": row.get("Context", ""),
             })
-
     return pd.DataFrame(out_rows)
 
-# ---------- EXPORT (safe for empty DataFrames) ----------
+# ---------- EXPORT (safe even if empty) ----------
 
 def df_to_excel_bytes(df: pd.DataFrame) -> bytes:
-    """
-    Always returns a valid XLSX, even if df is empty.
-    """
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
         (df if df is not None else pd.DataFrame()).to_excel(writer, index=False, sheet_name="Weld Log")
         worksheet = writer.sheets["Weld Log"]
-
-        # Auto column width (robust to empty frames)
         for i, col in enumerate((df.columns if df is not None else [])):
-            # Length of header
             header_len = len(str(col))
-            # Mean length of values (safe even if empty)
             series = df[col].astype(str) if df is not None else pd.Series(dtype=str)
-            if len(series) == 0:
-                mean_len = 0
-            else:
-                # Use average of value lengths; ignore NaN safely
-                mean_len = float(series.str.len().mean(skipna=True) or 0)
+            mean_len = float(series.str.len().mean(skipna=True) or 0) if len(series) else 0
             width = min(50, max(12, int(round(max(header_len, mean_len) + 6))))
             worksheet.set_column(i, i, width)
     buf.seek(0)
