@@ -52,13 +52,13 @@ with st.sidebar:
         index=0,
         help="Use gpt-4o for best accuracy."
     )
-    render_scale = st.slider("PDF render scale (clarity vs speed)", 1.5, 3.0, 2.5, 0.1)
-    st.caption("If small tags are missed, increase to 2.5–3.0 and re-run.")
+    render_scale = st.slider("PDF render scale (clarity vs speed)", 1.5, 3.0, 2.8, 0.1)
+    st.caption("If small tags are missed, increase to 3.0 and re-run.")
 
 # -----------------------------
 # 3) PDF → PIL images
 # -----------------------------
-def pdf_bytes_to_images(pdf_bytes: bytes, scale: float = 2.5) -> List[Image.Image]:
+def pdf_bytes_to_images(pdf_bytes: bytes, scale: float = 2.8) -> List[Image.Image]:
     imgs: List[Image.Image] = []
     pdf = pdfium.PdfDocument(io.BytesIO(pdf_bytes))
     for i in range(len(pdf)):
@@ -73,7 +73,7 @@ def pil_to_b64(img: Image.Image, quality: int = 85) -> str:
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 # -----------------------------
-# 4) Vision prompt (strict)
+# 4) Vision prompt (STRICT: ignore legends/title blocks/tables)
 # -----------------------------
 SYSTEM_PROMPT = '''
 You are an expert welding QA/QC document reader.
@@ -91,10 +91,11 @@ TASK: Extract a weld list with ONLY these fields:
 - spec: the pipeline spec (e.g., CSJ, CSDN15). If a single global spec clearly applies to all welds on the sheet, you may apply it; otherwise use "".
 
 CRITICAL RULES:
-- DO NOT expand/assume ranges (e.g., "W01–W50"). Only return welds you can literally read, one by one.
-- DO NOT invent missing fields. Use "" for unknowns.
-- Never classify as Field unless "FW/F/W/Field" is clearly printed near that weld tag.
-- If uncertain about shop_or_field, default to "Shop".
+1) ONLY return weld numbers that are clearly visible as W-tags (e.g., W1, W01, W123) **placed next to a drawn joint on the isometric** (a junction of pipe/fitting). 
+2) IGNORE text from title blocks, borders, legends, revision notes, BOM/spec tables, general notes, and any schedules. Do NOT read W-tags out of tables or legends.
+3) DO NOT expand ranges (e.g., "W01–W50"). Only return the tags you can literally read as individual labels near joints.
+4) Never classify as Field unless "FW/F/W/Field" is clearly printed near that weld tag. If uncertain, default to "Shop".
+5) If any field is missing/illegible, use "" for that field, but still include the weld if weld_number is present.
 
 Return JSON only in this schema:
 {"welds":[
@@ -102,8 +103,8 @@ Return JSON only in this schema:
 ]}
 
 Additional constraints:
-- A weld_number must look like a tag such as W1, W01, W123 (letter W followed by digits).
-- If you are not sure the text is a weld tag, do not include it.
+- A valid weld_number MUST look like W followed by 1–4 digits (e.g., W1, W01, W1234). 
+- If you are not sure the text is a weld tag next to a joint, do not include it.
 '''
 
 # -----------------------------
@@ -129,7 +130,7 @@ def call_vision(images: List[Image.Image], model_name: str) -> Dict[str, Any]:
         )
         text = resp.choices[0].message.content or ""
     except Exception:
-        # Fallback: responses API (kept for robustness)
+        # Fallback: responses API
         try:
             alt_parts = [{"type": "input_text", "text": "Extract JSON only."}]
             for img in images:
@@ -188,7 +189,7 @@ def to_table(data: Dict[str, Any]) -> pd.DataFrame:
     for w in data.get("welds", []):
         wn = str(w.get("weld_number", "")).strip()
         if not is_valid_weld_number(wn):
-            continue  # discard anything not like W01/W1/W123
+            continue  # keep only W + digits
         rows.append({
             "Weld Number": wn.upper(),
             "Shop / Field": normalise_shop_field(w.get("shop_or_field", "")),
@@ -200,15 +201,14 @@ def to_table(data: Dict[str, Any]) -> pd.DataFrame:
     if df.empty:
         return df
 
-    # Safety cap: if way too many welds, assume hallucination and keep most plausible subset
+    # Safety cap: if absurdly high, assume hallucination; keep most plausible subset
     MAX_WELDS = 50
     if len(df) > MAX_WELDS:
-        st.warning(f"Model returned {len(df)} welds which is unusually high. Keeping the first {MAX_WELDS} valid tags.")
-        # Prefer rows that have any non-empty extra field first
+        st.warning(f"Model returned {len(df)} welds (unusually high). Keeping the {MAX_WELDS} most plausible tags.")
         df["_score"] = (df["Weld Size"].astype(str).str.len() > 0).astype(int) + (df["Spec"].astype(str).str.len() > 0).astype(int)
         df = df.sort_values(["_score", "Weld Number"], ascending=[False, True]).head(MAX_WELDS).drop(columns=["_score"])
 
-    # Sort by numeric part of the tag if possible
+    # Sort by numeric part
     def tag_num(s: str) -> int:
         try:
             return int(re.sub(r"^[Ww]", "", s))
@@ -289,11 +289,10 @@ if run:
 
     st.subheader("Results")
     if df_pred.empty:
-        st.error("No welds found. Increase PDF render scale (2.5–3.0) and re-run.")
+        st.error("No welds found. Increase PDF render scale (3.0) and re-run.")
     else:
         st.dataframe(df_pred, use_container_width=True)
 
-        # Download
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
             df_pred.to_excel(w, index=False, sheet_name="Weld Log (4 fields)")
