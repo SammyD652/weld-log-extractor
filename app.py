@@ -48,8 +48,12 @@ def main():
             help="If ON, only accepts normalized W-<n>, SW-<n>, or BW-<n>."
         )
         force_ocr = st.checkbox(
-            "Force OCR fallback (for scanned PDFs)", value=False,
+            "Force OCR fallback (for scanned PDFs)", value=True,
             help="Turn ON if Raw text view shows little/no text."
+        )
+        aggressive = st.checkbox(
+            "Aggressive SW/BW/W finder (fix split chars, O↔0, l↔1)", value=True,
+            help="Joins up to 5 lines and fixes OCR confusions inside numbers."
         )
         llm_enrichment = st.checkbox(
             "Use LLM to fill Size / Type / Material (temp=0)", value=False
@@ -74,7 +78,7 @@ def main():
 
     # Find candidates
     with st.spinner("Finding weld candidates…"):
-        candidates = find_weld_candidates(pages)
+        candidates = find_weld_candidates(pages, aggressive=aggressive)
 
     with st.expander("Debug view: All candidates found"):
         st.write(candidates)
@@ -111,10 +115,10 @@ def main():
     st.subheader("Weld Log (deterministic)")
     st.write(f"Total welds: **{len(df)}**")
 
-    # ✅ Fix: use_container_width instead of width='stretch'
+    # Table
     st.dataframe(df.drop(columns=["Context"], errors="ignore"), use_container_width=True)
 
-    # Safe Excel export (works even if df is empty)
+    # Excel export (safe if empty)
     excel_df = df.drop(columns=["Context"], errors="ignore")
     excel_bytes = df_to_excel_bytes(excel_df)
     st.download_button(
@@ -126,8 +130,8 @@ def main():
 
     if len(df) == 0:
         st.info(
-            "No weld IDs detected. This drawing may use labels like **SW 001** split across lines. "
-            "Keep **Strict pattern OFF** first, and if Raw text is sparse, toggle **Force OCR fallback** ON."
+            "No weld IDs detected. Keep **Strict pattern OFF** first. If text is sparse, keep **Force OCR fallback** ON. "
+            "Aggressive finder joins split characters like `S\nW\n0\n0\n1` and fixes OCR confusions."
         )
 
 if __name__ == "__main__":
