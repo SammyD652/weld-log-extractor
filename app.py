@@ -39,21 +39,27 @@ def main():
             set_api_key_in_session(api_key)
 
         st.markdown("**Extraction Controls**")
-        exclude_field_welds = st.checkbox("Exclude Field Welds (FW)", value=True,
-                                           help="Removes FW / FIELD WELD mentions by context.")
-        strict_regex = st.checkbox("Strict weld pattern (W-### only)", value=False,
-                                   help="If ON, only accepts W-<number> forms.")
-        force_ocr = st.checkbox("Force OCR fallback (for scanned PDFs)", value=False,
-                                help="Turn ON if Raw text view shows little/no text.")
-        llm_enrichment = st.checkbox("Use LLM to fill Size / Type / Material (temp=0)", value=False)
+        exclude_field_welds = st.checkbox(
+            "Exclude Field Welds (FW)", value=True,
+            help="Removes FW / FIELD WELD mentions by context."
+        )
+        strict_regex = st.checkbox(
+            "Strict weld pattern (W-### / SW-### / BW-### only)", value=False,
+            help="If ON, only accepts normalized W-<n>, SW-<n>, or BW-<n>."
+        )
+        force_ocr = st.checkbox(
+            "Force OCR fallback (for scanned PDFs)", value=False,
+            help="Turn ON if Raw text view shows little/no text."
+        )
+        llm_enrichment = st.checkbox(
+            "Use LLM to fill Size / Type / Material (temp=0)", value=False
+        )
         st.caption("Tip: First verify the weld COUNT with LLM OFF. Then try LLM to fill details.")
 
     uploaded = st.file_uploader("Upload PDF isometric drawing", type=["pdf"])
-
     if uploaded is None:
         st.info("Upload an ISO PDF to begin.")
         return
-
     pdf_bytes = uploaded.read()
 
     with st.spinner("Reading PDF text deterministically…"):
@@ -91,37 +97,4 @@ def main():
         "Joint Type": ["" for _ in welds],
         "Material Description": ["" for _ in welds],
         "Source Page": [w["page"] for w in welds],
-        "Context": [w["context"] for w in welds],
-    })
-
-    # Optional LLM enrichment
-    if llm_enrichment:
-        if not get_api_key():
-            st.warning("LLM enrichment requires an OpenAI API key in the sidebar.")
-        else:
-            with st.spinner("LLM enrichment (deterministic, temp=0)…"):
-                df = enrich_with_llm_fields(df, api_key=get_api_key())
-
-    st.subheader("Weld Log (deterministic)")
-    st.write(f"Total welds: **{len(df)}**")
-
-    # Show table (new API: width='stretch' instead of deprecated use_container_width)
-    st.dataframe(df.drop(columns=["Context"], errors="ignore"), width='stretch')
-
-    # Safe Excel export (works even if df is empty)
-    excel_df = df.drop(columns=["Context"], errors="ignore")
-    excel_bytes = df_to_excel_bytes(excel_df)
-    st.download_button(
-        "Download Excel",
-        data=excel_bytes,
-        file_name=f"weld_log_{int(time.time())}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        disabled=excel_df is None
-    )
-
-    if len(df) == 0:
-        st.info("No weld IDs detected. If your PDF is scanned/image-only, toggle **Force OCR fallback** in the sidebar. "
-                "Also try turning **Strict pattern** OFF to allow forms like `W 12`, `W_12`, `W:12`.")
-
-if __name__ == "__main__":
-    main()
+        "Context
