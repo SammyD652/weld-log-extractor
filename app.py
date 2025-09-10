@@ -53,7 +53,10 @@ with st.sidebar:
         help="Use gpt-4o for best accuracy."
     )
     render_scale = st.slider("PDF render scale (clarity vs speed)", 1.5, 3.0, 3.0, 0.1)
-    st.caption("If small tags are missed, increase to 3.0 and re-run.")
+    strict_crop = st.checkbox("Strict drawing-only mode (crop out title block / BOM / legends)", True)
+    per_sheet_cap = st.number_input("Max welds per sheet (cap)", min_value=5, max_value=200, value=25, step=5)
+    show_debug = st.checkbox("Show debug cropped images", False)
+    st.caption("If tags are tiny, use scale 3.0. Strict mode reduces false positives from tables/legends.")
 
 # -----------------------------
 # 3) PDF → PIL images
@@ -66,6 +69,22 @@ def pdf_bytes_to_images(pdf_bytes: bytes, scale: float = 3.0) -> List[Image.Imag
         pil = page.render(scale=scale).to_pil()
         imgs.append(pil.convert("RGB"))
     return imgs
+
+def crop_to_drawing(img: Image.Image) -> Image.Image:
+    """
+    Generic crop that removes common areas where title blocks/BOM/legends live.
+    Keeps the central band where the iso sketch usually is.
+    Tuned for typical DGR/D10EC isometric layouts.
+    """
+    w, h = img.size
+    # Trim ~8% sides, ~5% top, and ~20% bottom (title block usually bottom-right)
+    left   = int(w * 0.08)
+    right  = int(w * 0.92)
+    top    = int(h * 0.05)
+    bottom = int(h * 0.80)
+    if right - left < 50 or bottom - top < 50:
+        return img  # fail-safe
+    return img.crop((left, top, right, bottom))
 
 def pil_to_b64(img: Image.Image, quality: int = 85) -> str:
     buf = io.BytesIO()
@@ -91,9 +110,9 @@ TASK: Extract a weld list with ONLY these fields:
 - spec: the pipeline spec (e.g., CSJ, CSDN15). If a single global spec clearly applies to all welds on the sheet, you may apply it; otherwise use "".
 
 CRITICAL RULES:
-1) ONLY return weld numbers that are clearly visible as W-tags (e.g., W1, W01, W123) placed next to a drawn joint on the isometric.
-2) IGNORE text from title blocks, borders, legends, revision notes, BOM/spec tables, general notes, and schedules. Do NOT read W-tags out of tables or legends.
-3) DO NOT expand ranges (e.g., "W01–W50"). Only return tags you literally read as individual labels near joints.
+1) ONLY return weld numbers that are clearly visible as W-tags (e.g., W1, W01, W123) placed next to a drawn joint on the isometric sketch.
+2) IGNORE text from title blocks, borders, legends, revision notes, BOM/spec tables, general notes, cut piece lists, and schedules. Do NOT read W-tags out of tables/legends.
+3) DO NOT expand ranges (e.g., "W01–W50"). Only return the tags you literally read as individual labels near joints.
 4) Never classify as Field unless "FW/F/W/Field" is clearly printed near that weld tag. If uncertain, default to "Shop".
 5) If any field is missing/illegible, use "" for that field, but still include the weld if weld_number is present.
 
@@ -103,7 +122,8 @@ Return JSON only in this schema:
 ]}
 
 Additional constraints:
-- A valid weld_number MUST look like W followed by 1–4 digits (e.g., W1, W01, W1234).
+- A valid weld_number MUST look like capital W followed by 1–4 digits (e.g., W1, W01, W1234). Optional single hyphen is allowed (e.g., W-12).
+- Reject any tag that starts with SW, FW, or contains spaces like "SW 001" — those are not weld numbers, they are weld type markers or legend items.
 - If you are not sure the text is a weld tag next to a joint, do not include it.
 '''
 
@@ -111,7 +131,7 @@ GLOBAL_SIZE_PROMPT = '''
 You will be given one or more isometric page images. Decide if there is a SINGLE pipe size used across the sheet (e.g., ND 25, 25mm, DN25, 1").
 - Check BOM/ND tables, title block, and repeated size notes.
 - If there are multiple different sizes, return empty.
-- If exactly one size dominates the entire sheet, return it as text (e.g., "25", "DN25", "25mm", or "1\"").
+- If exactly one size dominates the entire sheet, return it as text (e.g., "65", "DN65", "65mm", or "2.5\"").
 
 Return JSON ONLY:
 {"single_size": "<text or empty string>"}
@@ -123,10 +143,7 @@ Return JSON ONLY:
 def call_chat_completions(images: List[Image.Image], sys_prompt: str, user_intro_text: str) -> str:
     parts = [{"type": "text", "text": user_intro_text}]
     for img in images:
-        parts.append({
-            "type": "image_url",
-            "image_url": {"url": f"data:image/jpeg;base64,{pil_to_b64(img)}"}
-        })
+        parts.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{pil_to_b64(img)}"}})
     resp = client.chat.completions.create(
         model=model,
         messages=[
@@ -155,9 +172,7 @@ def detect_global_size(images: List[Image.Image]) -> str:
     try:
         data = json.loads(text)
         size = str(data.get("single_size", "")).strip()
-        # quick cleanup: remove trailing punctuation
-        size = size.rstrip(".,; ")
-        return size
+        return size.rstrip(".,; ")
     except Exception:
         try:
             start, end = text.find("{"), text.rfind("}")
@@ -171,7 +186,8 @@ def detect_global_size(images: List[Image.Image]) -> str:
 # -----------------------------
 # 6) Normalisation + validation + table
 # -----------------------------
-WELD_TAG_RE = re.compile(r"^[Ww]\d{1,4}$")  # W1..W9999
+# Valid weld number: W + optional hyphen + 1..4 digits; explicitly ban SW*, FW*, spaces.
+WELD_TAG_RE = re.compile(r"^W-?\d{1,4}$")
 
 def normalise_shop_field(val: str) -> str:
     if not val:
@@ -186,17 +202,25 @@ def normalise_shop_field(val: str) -> str:
 def is_valid_weld_number(s: str) -> bool:
     if not s:
         return False
-    s = s.strip()
+    s = str(s).strip().upper()
+    if s.startswith("SW") or s.startswith("FW") or " " in s:
+        return False
     return bool(WELD_TAG_RE.match(s))
 
-def to_table(data: Dict[str, Any]) -> pd.DataFrame:
+def sort_key_weld(s: str) -> int:
+    try:
+        return int(re.sub(r"^W-?", "", s))
+    except Exception:
+        return 10**9
+
+def to_table(data: Dict[str, Any], cap: int) -> pd.DataFrame:
     rows = []
     for w in data.get("welds", []):
-        wn = str(w.get("weld_number", "")).strip()
-        if not is_valid_weld_number(wn):
+        raw = str(w.get("weld_number", "")).strip().upper()
+        if not is_valid_weld_number(raw):
             continue
         rows.append({
-            "Weld Number": wn.upper(),
+            "Weld Number": raw,
             "Shop / Field": normalise_shop_field(w.get("shop_or_field", "")),
             "Weld Size": str(w.get("weld_size", "")).strip(),
             "Spec": str(w.get("spec", "")).strip(),
@@ -206,20 +230,13 @@ def to_table(data: Dict[str, Any]) -> pd.DataFrame:
     if df.empty:
         return df
 
-    # Safety cap: if absurdly high, assume hallucination; keep most plausible subset
-    MAX_WELDS = 50
-    if len(df) > MAX_WELDS:
-        st.warning(f"Model returned {len(df)} welds (unusually high). Keeping the {MAX_WELDS} most plausible tags.")
+    # Safety cap per sheet
+    if len(df) > cap:
+        st.warning(f"Sheet produced {len(df)} welds (over cap {cap}). Keeping the most plausible {cap}.")
         df["_score"] = (df["Weld Size"].astype(str).str.len() > 0).astype(int) + (df["Spec"].astype(str).str.len() > 0).astype(int)
-        df = df.sort_values(["_score", "Weld Number"], ascending=[False, True]).head(MAX_WELDS).drop(columns=["_score"])
+        df = df.sort_values(["_score", "Weld Number"], ascending=[False, True]).head(cap).drop(columns=["_score"])
 
-    # Sort by numeric part
-    def tag_num(s: str) -> int:
-        try:
-            return int(re.sub(r"^[Ww]", "", s))
-        except Exception:
-            return 10**9
-    df = df.sort_values(by="Weld Number", key=lambda s: s.map(tag_num)).reset_index(drop=True)
+    df = df.sort_values(by="Weld Number", key=lambda s: s.map(sort_key_weld)).reset_index(drop=True)
     return df
 
 # -----------------------------
@@ -267,7 +284,7 @@ def compare(pred: pd.DataFrame, truth: pd.DataFrame) -> Tuple[pd.DataFrame, Dict
 # 8) UI – uploads
 # -----------------------------
 st.subheader("1) Upload PDF(s)")
-pdfs = st.file_uploader("Drop one or more PDFs (isometrics or weld logs)", type=["pdf"], accept_multiple_files=True)
+pdf_files = st.file_uploader("Drop one or more PDFs (isometrics or weld logs)", type=["pdf"], accept_multiple_files=True)
 
 st.subheader("2) (Optional) Upload Ground Truth Excel")
 truth_file = st.file_uploader("Drop your Excel containing the 4 fields", type=["xlsx", "xls"])
@@ -278,53 +295,70 @@ run = st.button("Run Extraction", type="primary", use_container_width=True)
 # 9) Main
 # -----------------------------
 if run:
-    if not pdfs:
+    if not pdf_files:
         st.warning("Please upload at least one PDF.")
         st.stop()
 
-    all_imgs: List[Image.Image] = []
-    with st.spinner("Rendering PDF pages…"):
-        for f in pdfs:
-            all_imgs.extend(pdf_bytes_to_images(f.read(), scale=render_scale))
-    st.success(f"Rendered {len(all_imgs)} page image(s).")
+    all_results = []
+    all_imgs_debug = []
 
-    with st.spinner("Extracting welds with GPT-4o…"):
-        result = call_vision_extract(all_imgs)
-    df_pred = to_table(result)
+    for f in pdf_files:
+        file_bytes = f.read()
+        with st.spinner(f"Rendering PDF: {f.name}"):
+            full_imgs = pdf_bytes_to_images(file_bytes, scale=render_scale)
 
-    # -------- Global size fallback (fill blanks if the sheet uses a single size) --------
-    if not df_pred.empty:
-        blanks = df_pred["Weld Size"].astype(str).str.strip().eq("").sum()
-        if blanks > 0:
-            single_size = detect_global_size(all_imgs)
-            if single_size:
-                df_pred["Weld Size"] = df_pred["Weld Size"].apply(lambda x: single_size if str(x).strip() == "" else x)
+        # Choose which images to analyze
+        imgs = [crop_to_drawing(im) for im in full_imgs] if strict_crop else full_imgs
+
+        if show_debug:
+            with st.expander(f"Debug: {f.name} ({len(imgs)} cropped page(s))"):
+                for i, im in enumerate(imgs, 1):
+                    st.image(im, caption=f"{f.name} – Cropped page {i}", use_container_width=True)
+
+        with st.spinner(f"Extracting welds: {f.name}"):
+            result = call_vision_extract(imgs)
+            df_pred = to_table(result, cap=per_sheet_cap)
+
+        # Global size fallback per sheet (only if a single size across the sheet)
+        if not df_pred.empty:
+            blanks = df_pred["Weld Size"].astype(str).str.strip().eq("").sum()
+            if blanks > 0:
+                single_size = detect_global_size(imgs)
+                if single_size:
+                    df_pred["Weld Size"] = df_pred["Weld Size"].apply(lambda x: single_size if str(x).strip() == "" else x)
+
+        if not df_pred.empty:
+            df_pred.insert(0, "Source File", f.name)
+            all_results.append(df_pred)
+
+    if not all_results:
+        st.error("No welds found. Increase PDF render scale (3.0) and re-run. Try keeping Strict mode ON.")
+        st.stop()
+
+    final_df = pd.concat(all_results, ignore_index=True)
 
     st.subheader("Results")
-    if df_pred.empty:
-        st.error("No welds found. Increase PDF render scale (3.0) and re-run.")
-    else:
-        st.dataframe(df_pred, use_container_width=True)
+    st.dataframe(final_df, use_container_width=True)
 
-        # Download
-        buf = io.BytesIO()
-        with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
-            df_pred.to_excel(w, index=False, sheet_name="Weld Log (4 fields)")
-        st.download_button(
-            "Download Excel",
-            data=buf.getvalue(),
-            file_name="weld_log_4fields.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True
-        )
+    # Download
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
+        final_df.to_excel(w, index=False, sheet_name="Weld Log (4 fields)")
+    st.download_button(
+        "Download Excel",
+        data=buf.getvalue(),
+        file_name="weld_log_4fields.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True
+    )
 
-    if truth_file and not df_pred.empty:
+    if truth_file:
         st.subheader("Accuracy Check (vs. your Excel)")
         df_truth = read_truth_excel(truth_file.read())
         if df_truth.empty:
             st.warning("Could not detect expected columns in your Excel.")
         else:
-            comp, stats = compare(df_pred, df_truth)
+            comp, stats = compare(final_df.drop(columns=["Source File"], errors="ignore"), df_truth)
             if stats:
                 st.write(f"**Match Rates** – Shop/Field: {stats.get('Shop / Field',0)}% | "
                          f"Weld Size: {stats.get('Weld Size',0)}% | Spec: {stats.get('Spec',0)}%")
