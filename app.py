@@ -1,9 +1,4 @@
-import os
-import io
-import json
 import time
-from typing import List, Dict, Any
-
 import streamlit as st
 import pandas as pd
 
@@ -29,7 +24,7 @@ def set_api_key_in_session(k: str):
 def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
-    st.caption("Upload ISO PDF → deterministic text parsing (+OCR fallback for scans) → structured weld log → Excel")
+    st.caption("Upload ISO PDF → deterministic text parsing (+OCR fallback) → weld IDs → Excel. Focus: accuracy & consistency.")
 
     with st.sidebar:
         st.subheader("Settings")
@@ -41,19 +36,18 @@ def main():
         st.markdown("**Extraction Controls**")
         exclude_field_welds = st.checkbox(
             "Exclude Field Welds (FW)", value=True,
-            help="Removes FW / FIELD WELD mentions by context."
+            help="Remove FW / FIELD WELD by context."
         )
         strict_regex = st.checkbox(
-            "Strict weld pattern (W-### / SW-### / BW-### only)", value=False,
-            help="If ON, only accepts normalized W-<n>, SW-<n>, or BW-<n>."
+            "Strict pattern (W-### / SW-### / BW-### only)", value=False,
+            help="If ON, keep only normalized forms."
         )
         force_ocr = st.checkbox(
             "Force OCR fallback (for scanned PDFs)", value=True,
-            help="Turn ON if Raw text view shows little/no text."
+            help="Turn ON if Raw text has little/no content."
         )
         aggressive = st.checkbox(
-            "Aggressive SW/BW/W finder (fix split chars, O↔0, l↔1)", value=True,
-            help="Joins up to 5 lines and fixes OCR confusions inside numbers."
+            "Aggressive SW/BW/W finder (join ladders, fix O↔0, l↔1)", value=True
         )
         llm_enrichment = st.checkbox(
             "Use LLM to fill Size / Type / Material (temp=0)", value=False
@@ -66,24 +60,24 @@ def main():
         return
     pdf_bytes = uploaded.read()
 
-    with st.spinner("Reading PDF text deterministically…"):
+    with st.spinner("Reading PDF text…"):
         pages = extract_pdf_text_per_page(pdf_bytes, enable_ocr_fallback=force_ocr)
 
-    # Debug: show raw page text
     with st.expander("Debug view: Raw text per page"):
         for p in pages:
             preview = p["text"] if p["text"] else "<no text on this page>"
             st.markdown(f"**Page {p['page']}** — {len(p['text'])} chars")
             st.code(preview[:3000])
 
-    # Find candidates
     with st.spinner("Finding weld candidates…"):
-        candidates = find_weld_candidates(pages, aggressive=aggressive)
+        candidates, match_preview = find_weld_candidates(pages, aggressive=aggressive, return_preview=True)
+
+    with st.expander("Debug view: Matches preview (strings we matched)"):
+        st.write(match_preview[:200])
 
     with st.expander("Debug view: All candidates found"):
         st.write(candidates)
 
-    # Filter / normalize
     with st.spinner("Filtering / normalizing…"):
         welds = filter_and_normalize_welds(
             candidates,
@@ -94,7 +88,6 @@ def main():
     with st.expander("Debug view: Filtered weld IDs"):
         st.write(welds)
 
-    # Build DataFrame
     df = pd.DataFrame({
         "Weld Number": [w["weld_id"] for w in welds],
         "Joint Size (ND)": ["" for _ in welds],
@@ -104,7 +97,6 @@ def main():
         "Context": [w["context"] for w in welds],
     })
 
-    # Optional LLM enrichment
     if llm_enrichment:
         if not get_api_key():
             st.warning("LLM enrichment requires an OpenAI API key in the sidebar.")
@@ -114,11 +106,8 @@ def main():
 
     st.subheader("Weld Log (deterministic)")
     st.write(f"Total welds: **{len(df)}**")
-
-    # Table
     st.dataframe(df.drop(columns=["Context"], errors="ignore"), use_container_width=True)
 
-    # Excel export (safe if empty)
     excel_df = df.drop(columns=["Context"], errors="ignore")
     excel_bytes = df_to_excel_bytes(excel_df)
     st.download_button(
@@ -129,10 +118,7 @@ def main():
     )
 
     if len(df) == 0:
-        st.info(
-            "No weld IDs detected. Keep **Strict pattern OFF** first. If text is sparse, keep **Force OCR fallback** ON. "
-            "Aggressive finder joins split characters like `S\nW\n0\n0\n1` and fixes OCR confusions."
-        )
+        st.info("Still 0? Keep **Force OCR fallback** and **Aggressive finder** ON. Make sure **Strict pattern** is OFF for the first pass.")
 
 if __name__ == "__main__":
     main()
