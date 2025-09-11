@@ -1,10 +1,5 @@
-streamlit==1.38.0
-pdfplumber==0.11.4
-pdfminer-six==20231228
-pypdf==4.3.1
-pandas==2.2.2
-XlsxWriter==3.2.0
-pypdfium2==4.30.0
-pytesseract==0.3.10
-Pillow==10.4.0
-openai==1.40.6
+streamlit>=1.36
+pandas>=2.2
+openai>=1.40
+pymupdf>=1.24
+Pillow>=10.4
