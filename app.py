@@ -80,16 +80,21 @@ def gpt_detect_welds(page_img: Image.Image) -> List[Dict]:
     """Ask GPT-4o to locate SW tags and give context crops."""
     b64 = img_to_b64(page_img)
     resp = client.responses.create(
-        model="gpt-4o",
-        input=[
-            {"role": "system", "content": SYSTEM_DETECT},
-            {"role": "user", "content": [
-                {"type": "input_text", "text": "Detect all SW weld tags and return JSON only."},
-                {"type": "input_image", "image_data": b64},
-            ]}
-        ],
-        temperature=0
-    )
+    model="gpt-4o",
+    input=[
+        {"role": "system", "content": SYSTEM_DETECT},
+        {"role": "user", "content": [
+            {"type": "text", "text": "Detect weld tags"},
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/png;base64,{b64}"
+                }
+            },
+        ]},
+    ],
+)
+
 
     text = ""
     for blk in resp.output[0].content:
